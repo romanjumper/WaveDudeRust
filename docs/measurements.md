@@ -334,6 +334,53 @@ four runs, 20.3 to 21.0 after). The hashes of the field, the
 previous field, the intensity stages and two captures every 50 of 300 steps of nine projects (mirrors, both stencils,
 Mur and reflective edges, many media, many sources, a 3060x1260 lens) are bit for bit the same before and after.
 
+## The CPU engine's capture in the step
+
+A capture the caller announces before a step (`WaveEngine::plan_capture`, which the run worker and the bench call; the
+GPU engine ignores it) is converted by the CPU engine's last pass of that step (`crates/waveduderust/src/engine/cpu.rs`,
+`Capturing`) instead of a pass over the canvas afterwards: each block row of the planes as soon as its band has written
+the field and the intensity rows of it, while they are in the cache, with `capture.rs`'s per-row conversion
+(`block_row`, the same block means, root and conversion as `plane_rows`). The bands start on canvas rows that are
+multiples of 4, the first band longer by `rim % 4`, so no block row of divisor 1, 2 or 4 straddles two; the 9-point
+pass runs in bands of 32 rows on a captured sub-step (row by row otherwise, as before), and the block rows holding a
+cell its forcing changes after the pass are converted again after the step. `begin_capture` hands out the planes
+made in the step when the shape matches and converts as before otherwise.
+
+2026-11-25, the VirtualBox guest above (Ryzen 7 4700U, 8 vCPUs), before (ba2adeb) and after, alternated, two runs
+each. Blank scene, ms a step, `RAYON_NUM_THREADS=<n> waveduderust-cli bench --width 1920 --height 1080 --rim <0|32>
+--stencil <nine|fourth> --captures-every 2 --steps 200` (the bench's second row, both planes as f16 every 2 steps):
+
+| Stencil, rim, threads | Before | After |
+|---|---|---|
+| 9-point, 0, 1 | 9.57 to 9.59 | 8.47 to 8.76 |
+| 9-point, 32, 1 | 13.4 | 12.8 to 13.3 |
+| 4th order, 0, 1 | 15.1 | 14.0 to 14.5 |
+| 4th order, 32, 1 | 24.5 | 23.8 to 25.0 |
+| 9-point, 0, 8 | 4.71 to 4.93 | 4.20 to 4.41 |
+| 9-point, 32, 8 | 6.45 to 6.95 | 5.82 to 5.89 |
+| 4th order, 0, 8 | 5.55 to 5.73 | 5.14 to 5.43 |
+| 4th order, 32, 8 | 9.17 to 9.33 | 8.96 to 9.18 |
+
+Example projects as saved, which capture every 2 steps, seconds for `RAYON_NUM_THREADS=<n> /usr/bin/time -f %e
+waveduderust-cli probes --out <dir> --steps 300 <project>`, four runs each over two rounds:
+
+| Project, threads | Before | After |
+|---|---|---|
+| Example01, 1 | 5.21 to 5.69 | 5.44 to 5.67 |
+| Example21, 1 | 19.8 to 20.3 | 18.4 to 20.0 |
+| Example01, 8 | 1.95 to 2.03 | 1.86 to 2.08 |
+| Example21, 8 | 6.96 to 7.09 | 6.67 to 6.87 |
+
+With captures every 2 steps the blank canvas gains 5 to 15 % on 8 threads (least with the 4th order and rim 32, 0 to
+4 %) and up to 10 % on one thread (nothing measurable with the 4th order and rim 32). Example21 gains about 3 % on 8
+threads and is within the noise on one thread; Example01 (a small canvas) shows nothing measurable. The steps without
+a capture are unchanged (the bench's rows without captures are within the guest's noise). The hashes of the field, the
+previous field, the intensity stages and two captures every 50 of 300 steps of nine projects (mirrors, both stencils,
+Mur and reflective edges, many media, many sources, a 3060x1260 lens) are bit for bit the same before and after, with
+the captures converted after the step and with either capture planned (f16 full size; palette index, half size); a
+unit test compares planned and later captures of every divisor and format on odd canvases with rims 0, 1, 2, 3, 5
+and 6.
+
 ## Other operations
 
 2026-11-06 unless noted.

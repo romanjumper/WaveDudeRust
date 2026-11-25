@@ -16,6 +16,11 @@
 //! one pass over bands of rows that keeps each band's `w` in a small buffer (`modified_pass`); `next` is written
 //! over `prev`. With a rim, the CPML corrects the rim after each application (pml.rs).
 //!
+//! A capture planned for a step (`WaveEngine::plan_capture`) is converted by the step's last pass, each block row of
+//! the planes as soon as its band has written the field and intensity rows of it (`Capturing`); the bands start on
+//! canvas rows that are multiples of 4, so no block row straddles two. The 9-point's forcing, which changes a few
+//! cells after its pass, has their block rows converted again after the step.
+//!
 //! Threads: one driver thread; each pass fans out over rows or bands on the rayon pool, reading only its input
 //! field.
 
@@ -76,6 +81,12 @@ pub struct CpuEngine {
 	probes: Vec<(Layer, Vec<usize>)>,
 	probe_queue: ProbeQueue,
 	probe_reading: ProbeReadings,
+	/// The shape of the capture planned for the next step ([`WaveEngine::plan_capture`]).
+	planned: Option<FrameShape>,
+	/// The planes the last step captured while writing the canvas, for a `begin_capture` of their shape.
+	captured: Option<Snapshot>,
+	/// Planes to capture into next, the allocations of a capture handed back.
+	planes: Option<Snapshot>,
 }
 
 /// The bytes [`CpuEngine`] allocates by the grid of `scene` with `options`: the field, medium and stage planes, the
@@ -129,6 +140,9 @@ impl CpuEngine {
 			probes: Vec::new(),
 			probe_queue: ProbeQueue::default(),
 			probe_reading: ProbeReadings::default(),
+			planned: None,
+			captured: None,
+			planes: None,
 			shared: Shared::new(scene, options, n),
 		};
 		engine.load_scene();
@@ -148,6 +162,7 @@ impl CpuEngine {
 			self.u[at..at + gw].copy_from_slice(a);
 			self.prev[at..at + gw].copy_from_slice(b);
 		}
+		self.captured = None;
 	}
 
 	/// The padded field buffer (see [`SceneData::stride`]).
@@ -158,13 +173,80 @@ impl CpuEngine {
 	// The inherent calls below take `&mut self` like the trait's, so they win method resolution on a
 	// `CpuEngine`: callers on the concrete type get no `Result`.
 
-	/// [`WaveEngine::advance_one_step`], which cannot fail here.
+	/// [`WaveEngine::advance_one_step`], which cannot fail here. With a capture planned, its last sub-step converts
+	/// the canvas rows into the planes as it writes them.
 	pub fn advance_one_step(&mut self) {
-		for k in 0..self.shared.sub_steps {
+		let mut planes = self.planned_planes();
+		let n = self.shared.sub_steps;
+		for k in 0..n {
 			self.shared.source_values(&mut self.values, k);
-			self.sub_step(self.shared.accumulates(k));
+			self.sub_step(self.shared.accumulates(k), if k + 1 == n { planes.as_mut() } else { None });
 		}
 		self.shared.time += 1;
+		if let Some(mut out) = planes {
+			if self.shared.scheme == TimeScheme::Leapfrog {
+				self.recapture_forced(&mut out);
+			}
+			out.step = self.shared.time - 1;
+			self.captured = Some(out);
+		}
+	}
+
+	/// Planes for the capture planned for this step, shaped and sized, when it can be made in the pass: a shape of this
+	/// canvas whose divisor divides 4 ([`band_lengths`]). An unclaimed capture's planes are kept for reuse.
+	fn planned_planes(&mut self) -> Option<Snapshot> {
+		if let Some(stale) = self.captured.take() {
+			self.planes = Some(stale);
+		}
+		let scene = &self.shared.scene;
+		let shape = self.planned.take().filter(|p| {
+			(p.canvas_width, p.canvas_height) == (scene.canvas_width, scene.canvas_height)
+				&& p.divisor > 0
+				&& 4 % p.divisor == 0
+		})?;
+		let mut out = self.planes.take().unwrap_or_else(|| Snapshot::new(shape));
+		out.shape = shape;
+		out.field.resize(shape.plane_bytes(), 0);
+		if self.shared.options.track_intensity {
+			out.intensity.resize(shape.plane_bytes(), 0);
+		} else {
+			out.intensity.clear();
+		}
+		Some(out)
+	}
+
+	/// Converts again the block rows of `out` that hold a cell the leapfrog's forcing drove after the pass wrote them
+	/// ([`force_next`](Self::force_next)), from the field and the stages after the step.
+	fn recapture_forced(&self, out: &mut Snapshot) {
+		let scene = &self.shared.scene;
+		let (s, rim, w, h) =
+			(self.stride, scene.rim as usize, scene.canvas_width as usize, scene.canvas_height as usize);
+		let shape = out.shape;
+		let div = shape.divisor as usize;
+		let mut rows: Vec<usize> = (self.groups.cells.iter())
+			.filter_map(|&c| {
+				let (x, y) = ((c % s).checked_sub(PAD + rim)?, (c / s).checked_sub(PAD + rim)?);
+				(x < w && y < h).then_some(y / div)
+			})
+			.collect();
+		rows.sort_unstable();
+		rows.dedup();
+		let capturing = self.capturing(&shape);
+		let mut scratch = CaptureScratch::default();
+		let bytes = capture::row_bytes(&shape);
+		for by in rows {
+			let (y0, at) = (by * div, scene.canvas_index(0, by * div));
+			let stages = (!self.s1.is_empty()).then(|| (&self.s1[at..], &self.s2[at..]));
+			let intensity = (!out.intensity.is_empty()).then(|| &mut out.intensity[by * bytes..][..bytes]);
+			let field = &mut out.field[by * bytes..][..bytes];
+			capturing.block(&self.u[at..], stages, div.min(h - y0), &mut scratch, field, intensity);
+		}
+	}
+
+	/// The capture of `shape` a pass makes.
+	fn capturing<'a>(&self, shape: &'a FrameShape) -> Capturing<'a> {
+		let scene = &self.shared.scene;
+		Capturing { shape, scale: self.shared.options.intensity_scale as f32, rim: scene.rim as usize, s: self.stride }
 	}
 
 	/// [`WaveEngine::sample_probes`], which cannot fail here.
@@ -270,18 +352,22 @@ impl CpuEngine {
 		}
 	}
 
-	/// The intensity stages and their weight when `intensity` (and tracked), for [`grid_rows`].
+	/// The intensity stages and their weight when `intensity` (and tracked).
 	fn stages<'a>(s1: &'a mut [f32], s2: &'a mut [f32], alpha: f32, intensity: bool) -> Option<Stages<'a>> {
 		(intensity && !s1.is_empty()).then_some(Stages { s1, s2, alpha })
 	}
 
-	/// The leapfrog pass of the 9-point stencil: writes the next field over `prev`, and the intensity
-	/// stages when `intensity`.
-	fn leapfrog_pass(&mut self, intensity: bool) {
+	/// The leapfrog pass of the 9-point stencil: writes the next field over `prev`, the intensity stages when
+	/// `intensity`, row by row ([`grid_rows`]), or with `planes` given in bands of [`BAND`] rows that also write them.
+	fn leapfrog_pass(&mut self, intensity: bool, planes: Option<&mut Snapshot>) {
 		let (s, gw) = (self.stride, self.shared.scene.grid_width() as usize);
+		let shape = planes.as_ref().map(|p| p.shape);
+		let capturing = shape.as_ref().map(|shape| self.capturing(shape));
 		let (u, c2, d, runs, cuts, mirrors) = (&self.u, &self.c2, &self.d, &self.runs, &self.cuts, self.mirrors);
+		let scene = &self.shared.scene;
+		let (gh, rim) = (scene.grid_height() as usize, scene.rim as usize);
 		let stages = Self::stages(&mut self.s1, &mut self.s2, self.alpha, intensity);
-		grid_rows(&mut self.prev, stages, s, gw, |r, next| {
+		let row = |r: usize, next: &mut [f32]| {
 			let at = r * s + PAD;
 			runs.of_row(r, row_cuts(cuts, mirrors, at, gw), |cells, medium, cuts| {
 				let (at, len, next) = (at + cells.start, cells.len(), &mut next[cells.clone()]);
@@ -297,17 +383,41 @@ impl CpuEngine {
 					}
 				}
 			});
+		};
+		let Some(planes) = planes else { return grid_rows(&mut self.prev, stages, s, gw, row) };
+		let alpha = stages.as_ref().map_or(0.0, |st| st.alpha);
+		let bands = bands(&mut self.prev, stages, None, Some(planes), s, gh, rim);
+		bands.into_par_iter().for_each_init(CaptureScratch::default, |scratch, band| {
+			let Band { r0, next, mut stages, mut planes, .. } = band;
+			for k in 0..next.len() / s {
+				let line = &mut next[k * s + PAD..][..gw];
+				row(r0 + k, line);
+				if let Some((s1, s2)) = &mut stages {
+					accumulate(&mut s1[k * s + PAD..][..gw], &mut s2[k * s + PAD..][..gw], line, alpha);
+				}
+				if let (Some(c), Some(p)) = (&capturing, &mut planes) {
+					c.after_row(
+						r0 + k - PAD,
+						r0 - PAD,
+						next,
+						stages.as_ref().map(|(a, b)| (&a[..], &b[..])),
+						p,
+						scratch,
+					);
+				}
+			}
 		});
 	}
 
-	/// The modified equation's pass: writes the next field over `prev`, and the intensity stages when `intensity`.
-	/// Each band of [`BAND`] grid rows computes its `w` with 3 rows each side into a buffer of its job
-	/// ([`Modified::w_row`]), each `w` row just before the first next row that reads it, so `w` stays in cache;
-	/// the rows on either side are computed by both bands, from the same inputs. The cells the CPML's second
+	/// The modified equation's pass: writes the next field over `prev`, the intensity stages when `intensity`, and
+	/// `planes` when given. Each band of [`BAND`] grid rows computes its `w` with 3 rows each side into a buffer of
+	/// its job ([`Modified::w_row`]), each `w` row just before the first next row that reads it, so `w` stays in
+	/// cache; the rows on either side are computed by both bands, from the same inputs. The cells the CPML's second
 	/// application reads go to `w` ([`rim_w`]).
-	fn modified_pass(&mut self, intensity: bool) {
+	fn modified_pass(&mut self, intensity: bool, planes: Option<&mut Snapshot>) {
 		let scene = &self.shared.scene;
-		let (s, gw, gh) = (self.stride, scene.grid_width() as usize, scene.grid_height() as usize);
+		let shape = planes.as_ref().map(|p| p.shape);
+		let capturing = shape.as_ref().map(|shape| self.capturing(shape));
 		let pass = Modified {
 			u: &self.u,
 			c2: &self.c2,
@@ -320,41 +430,26 @@ impl CpuEngine {
 			groups: &self.groups,
 			group_rows: &self.group_rows,
 			values: &self.values,
-			s,
-			gw,
-			gh,
+			s: self.stride,
+			gw: scene.grid_width() as usize,
+			gh: scene.grid_height() as usize,
 			rim: scene.rim as usize,
+			capturing: capturing.as_ref(),
 		};
-		let grid = PAD * s..(PAD + gh) * s;
-		let n = BAND * s;
 		let stages = Self::stages(&mut self.s1, &mut self.s2, self.alpha, intensity);
 		let alpha = stages.as_ref().map_or(0.0, |st| st.alpha);
-		let (mut s1, mut s2) = match stages {
-			Some(Stages { s1, s2, .. }) => (Some(s1[grid.clone()].chunks_mut(n)), Some(s2[grid.clone()].chunks_mut(n))),
-			None => (None, None),
-		};
-		let mut w = (!self.w.is_empty()).then(|| self.w[grid.clone()].chunks_mut(n));
-		fn take<'a>(c: &mut Option<std::slice::ChunksMut<'a, f32>>) -> Option<&'a mut [f32]> {
-			c.as_mut().and_then(Iterator::next)
-		}
-		let bands: Vec<Band<'_>> = self.prev[grid]
-			.chunks_mut(n)
-			.enumerate()
-			.map(|(k, next)| Band {
-				r0: PAD + k * BAND,
-				next,
-				stages: take(&mut s1).zip(take(&mut s2)),
-				w: take(&mut w),
-			})
-			.collect();
-		bands.into_par_iter().for_each_init(Vec::new, |buffer, band| pass.band(band, buffer, alpha));
+		let w = (!self.w.is_empty()).then_some(&mut self.w[..]);
+		let bands = bands(&mut self.prev, stages, w, planes, pass.s, pass.gh, pass.rim);
+		bands.into_par_iter().for_each_init(<(Vec<f32>, CaptureScratch)>::default, |(buffer, scratch), band| {
+			pass.band(band, buffer, scratch, alpha);
+		});
 	}
 
-	/// One sub-step; the next field ends in `u`.
-	fn sub_step(&mut self, intensity: bool) {
+	/// One sub-step; the next field ends in `u`. Given `planes`, the pass converts the canvas into them as it writes it.
+	fn sub_step(&mut self, intensity: bool, planes: Option<&mut Snapshot>) {
 		match self.shared.scheme {
 			TimeScheme::Leapfrog => {
-				self.leapfrog_pass(intensity);
+				self.leapfrog_pass(intensity, planes);
 				if let Some(p) = &mut self.pml {
 					p.apply(0, &self.u, &self.cuts, &self.c2, &mut self.prev, 1.0);
 				}
@@ -364,7 +459,7 @@ impl CpuEngine {
 				if let (Some(p), Some(out)) = (&mut self.pml, &mut self.corrections) {
 					p.apply_into(0, &self.u, &self.cuts, &self.c2, out, 1.0);
 				}
-				self.modified_pass(intensity);
+				self.modified_pass(intensity, planes);
 				if let Some(p) = &mut self.pml {
 					p.apply(1, &self.w, &self.cuts, &self.c2, &mut self.prev, INV12);
 				}
@@ -429,17 +524,166 @@ fn grid_rows(out: &mut [f32], stages: Option<Stages<'_>>, s: usize, gw: usize, r
 	}
 }
 
-/// Grid rows of a band of [`CpuEngine::modified_pass`]: each band computes 6 rows of `w` twice, and its `w`
+/// Grid rows of a band of the passes: the modified equation's computes 6 rows of `w` twice a band, and its `w`
 /// buffer of `BAND + 6` rows should stay in the core's cache.
 const BAND: usize = 32;
 
-/// A band of [`CpuEngine::modified_pass`]: its first padded row, its rows of `prev`, of the intensity stages
-/// when they advance, and of `w` with a rim.
+/// The lengths of the bands of `band` grid rows (a multiple of 4) over `gh` grid rows with `rim` rows of rim, the
+/// first longer by `rim % 4`: every later band starts on a canvas row that is a multiple of 4, so each block row of a
+/// capture (divisor 1, 2 or 4) lies in one band.
+fn band_lengths(gh: usize, rim: usize, band: usize) -> impl Iterator<Item = usize> {
+	let first = (band + rim % 4).min(gh);
+	std::iter::once(first).chain((first..gh).step_by(band).map(move |g| band.min(gh - g)))
+}
+
+/// `v` split into consecutive pieces of `lens[k] * unit` elements.
+fn split_lens<'a, T>(mut v: &'a mut [T], lens: &[usize], unit: usize) -> Vec<&'a mut [T]> {
+	lens.iter()
+		.map(|&n| {
+			let (piece, rest) = std::mem::take(&mut v).split_at_mut(n * unit);
+			v = rest;
+			piece
+		})
+		.collect()
+}
+
+/// A band of a pass: its first padded row, its rows of `prev`, of the intensity stages when they advance, of `w`
+/// when the pass keeps one, and of a capture's planes when the pass makes one.
 struct Band<'a> {
 	r0: usize,
 	next: &'a mut [f32],
 	stages: Option<(&'a mut [f32], &'a mut [f32])>,
 	w: Option<&'a mut [f32]>,
+	planes: Option<BandPlanes<'a>>,
+}
+
+/// The grid rows of the padded `prev`, `stages` and `w` (rows of `s`, `gh` grid rows with `rim` rows of rim) and the
+/// block rows of `planes` in bands of [`BAND`] rows ([`band_lengths`]).
+fn bands<'a>(
+	prev: &'a mut [f32],
+	stages: Option<Stages<'a>>,
+	w: Option<&'a mut [f32]>,
+	planes: Option<&'a mut Snapshot>,
+	s: usize,
+	gh: usize,
+	rim: usize,
+) -> Vec<Band<'a>> {
+	let lens: Vec<usize> = band_lengths(gh, rim, BAND).collect();
+	let grid = PAD * s..(PAD + gh) * s;
+	let (s1, s2) = match stages {
+		Some(Stages { s1, s2, .. }) => {
+			(split_lens(&mut s1[grid.clone()], &lens, s), split_lens(&mut s2[grid.clone()], &lens, s))
+		}
+		None => (Vec::new(), Vec::new()),
+	};
+	let w = w.map_or_else(Vec::new, |w| split_lens(&mut w[grid.clone()], &lens, s));
+	let planes = planes.map_or_else(Vec::new, |out| {
+		let (h, div) = (out.shape.canvas_height as usize, out.shape.divisor as usize);
+		let block = |g: usize| g.saturating_sub(rim).min(h).div_ceil(div);
+		let starts: Vec<usize> = lens.iter().scan(0, |g, &n| Some(std::mem::replace(g, *g + n))).collect();
+		let counts: Vec<usize> = starts.iter().zip(&lens).map(|(&g, &n)| block(g + n) - block(g)).collect();
+		let bytes = capture::row_bytes(&out.shape);
+		let field = split_lens(&mut out.field, &counts, bytes);
+		let tracked = !out.intensity.is_empty();
+		let mut intensity = tracked.then(|| split_lens(&mut out.intensity, &counts, bytes).into_iter());
+		field
+			.into_iter()
+			.zip(&starts)
+			.map(|(field, &g)| BandPlanes {
+				by0: block(g),
+				field,
+				intensity: intensity.as_mut().and_then(Iterator::next),
+			})
+			.collect()
+	});
+	let (mut s1, mut s2, mut w, mut planes) = (s1.into_iter(), s2.into_iter(), w.into_iter(), planes.into_iter());
+	let mut r0 = PAD;
+	split_lens(&mut prev[grid], &lens, s)
+		.into_iter()
+		.zip(&lens)
+		.map(|(next, &n)| {
+			let band = Band { r0, next, stages: s1.next().zip(s2.next()), w: w.next(), planes: planes.next() };
+			r0 += n;
+			band
+		})
+		.collect()
+}
+
+/// A band's share of a capture: its first block row and its output rows of the field plane and of the intensity
+/// plane when the intensity is tracked.
+struct BandPlanes<'a> {
+	by0: usize,
+	field: &'a mut [u8],
+	intensity: Option<&'a mut [u8]>,
+}
+
+/// Scratch of a capture made in a pass: the blended intensity of a block's rows and the block means.
+#[derive(Default)]
+struct CaptureScratch {
+	rows: Vec<f32>,
+	means: Vec<f32>,
+}
+
+/// A capture a pass makes in the last sub-step of a step ([`WaveEngine::plan_capture`]): the shape, the intensity's
+/// scale, the rim and the padded row length.
+struct Capturing<'a> {
+	shape: &'a FrameShape,
+	scale: f32,
+	rim: usize,
+	s: usize,
+}
+
+impl Capturing<'_> {
+	/// Converts the block row that grid row `gy` completes, if it completes one, into `planes`: `next` and `stages`
+	/// are the band's padded rows from grid row `g0`, written up to `gy`.
+	fn after_row(
+		&self,
+		gy: usize,
+		g0: usize,
+		next: &[f32],
+		stages: Option<(&[f32], &[f32])>,
+		planes: &mut BandPlanes<'_>,
+		scratch: &mut CaptureScratch,
+	) {
+		let (h, div) = (self.shape.canvas_height as usize, self.shape.divisor as usize);
+		let Some(y) = gy.checked_sub(self.rim).filter(|&y| y < h) else { return };
+		if (y + 1) % div != 0 && y + 1 != h {
+			return;
+		}
+		let (by, y0) = (y / div, y / div * div);
+		let at = (y0 + self.rim - g0) * self.s + PAD + self.rim;
+		let bytes = capture::row_bytes(self.shape);
+		let k = (by - planes.by0) * bytes;
+		let intensity = planes.intensity.as_deref_mut().map(|p| &mut p[k..][..bytes]);
+		let stages = stages.map(|(s1, s2)| (&s1[at..], &s2[at..]));
+		self.block(&next[at..], stages, y + 1 - y0, scratch, &mut planes.field[k..][..bytes], intensity);
+	}
+
+	/// Converts the `n` canvas rows of a block row into `field` and, given the stages, `intensity`: `u` and `stages`
+	/// hold the rows from their first canvas cell, rows of `s`.
+	fn block(
+		&self,
+		u: &[f32],
+		stages: Option<(&[f32], &[f32])>,
+		n: usize,
+		scratch: &mut CaptureScratch,
+		field: &mut [u8],
+		intensity: Option<&mut [u8]>,
+	) {
+		let (shape, s) = (self.shape, self.s);
+		let w = shape.canvas_width as usize;
+		scratch.means.resize(shape.width() as usize, 0.0);
+		capture::block_row(shape, Layer::Field, u, s, n, &mut scratch.means, field);
+		if let (Some((s1, s2)), Some(intensity)) = (stages, intensity) {
+			scratch.rows.resize(w * n, 0.0);
+			for (k, row) in scratch.rows.chunks_exact_mut(w).take(n).enumerate() {
+				for ((r, &a), &b) in row.iter_mut().zip(&s1[k * s..][..w]).zip(&s2[k * s..][..w]) {
+					*r = blend(a, b, self.scale);
+				}
+			}
+			capture::block_row(shape, Layer::Intensity, &scratch.rows, w, n, &mut scratch.means, intensity);
+		}
+	}
 }
 
 /// The inputs of [`CpuEngine::modified_pass`].
@@ -459,12 +703,14 @@ struct Modified<'a> {
 	gw: usize,
 	gh: usize,
 	rim: usize,
+	/// The capture the pass makes, if any.
+	capturing: Option<&'a Capturing<'a>>,
 }
 
 impl Modified<'_> {
-	/// Runs `band` with `buffer` for its `w` rows; `alpha` the intensity's EMA weight.
-	fn band(&self, band: Band<'_>, buffer: &mut Vec<f32>, alpha: f32) {
-		let Band { r0, next, mut stages, mut w } = band;
+	/// Runs `band` with `buffer` for its `w` rows and `scratch` for its capture; `alpha` the intensity's EMA weight.
+	fn band(&self, band: Band<'_>, buffer: &mut Vec<f32>, scratch: &mut CaptureScratch, alpha: f32) {
+		let Band { r0, next, mut stages, mut w, mut planes } = band;
 		let (s, gw) = (self.s, self.gw);
 		let h = next.len() / s;
 		if buffer.len() < (h + 6) * s {
@@ -485,6 +731,9 @@ impl Modified<'_> {
 			self.next_row(r, buffer, (k + 3) * s + PAD, line);
 			if let Some((s1, s2)) = &mut stages {
 				accumulate(&mut s1[k * s + PAD..][..gw], &mut s2[k * s + PAD..][..gw], line, alpha);
+			}
+			if let (Some(c), Some(p)) = (self.capturing, &mut planes) {
+				c.after_row(r - PAD, r0 - PAD, next, stages.as_ref().map(|(a, b)| (&a[..], &b[..])), p, scratch);
 			}
 		}
 	}
@@ -844,6 +1093,7 @@ impl WaveEngine for CpuEngine {
 		}
 		self.shared.reset();
 		self.probe_queue.clear();
+		self.captured = None;
 	}
 
 	fn set_track_intensity(&mut self, on: bool) {
@@ -852,6 +1102,7 @@ impl WaveEngine for CpuEngine {
 			let stages = if on { self.u.len() } else { 0 };
 			self.s1 = vec![0.0; stages];
 			self.s2 = vec![0.0; stages];
+			self.captured = None;
 		}
 	}
 
@@ -874,6 +1125,7 @@ impl WaveEngine for CpuEngine {
 		let Some(n) = self.shared.replacement(scene) else { return false };
 		self.shared.replace_scene(scene.clone(), n);
 		self.load_scene();
+		self.captured = None;
 		self.update_alpha();
 		true
 	}
@@ -905,9 +1157,25 @@ impl WaveEngine for CpuEngine {
 		Ok(())
 	}
 
+	fn plan_capture(&mut self, shape: &FrameShape) {
+		self.planned = Some(*shape);
+	}
+
+	/// The planes the last step captured when they have `shape` (`into` kept for the next), else a conversion now.
 	fn begin_capture(&mut self, shape: &FrameShape, mut into: Snapshot) -> Result<PendingCapture, EngineError> {
-		self.capture_into(shape, &mut into);
-		Ok(PendingCapture::done(into))
+		match self.captured.take() {
+			Some(captured) if captured.shape == *shape => {
+				self.planes = Some(into);
+				Ok(PendingCapture::done(captured))
+			}
+			other => {
+				if other.is_some() {
+					self.planes = other;
+				}
+				self.capture_into(shape, &mut into);
+				Ok(PendingCapture::done(into))
+			}
+		}
 	}
 
 	fn finish_capture(&mut self, pending: PendingCapture) -> Result<Snapshot, EngineError> {
@@ -1210,6 +1478,95 @@ mod tests {
 		let expect: [&[u32]; 6] = [&[], &[3, 1], &[], &[4], &[], &[0, 2]];
 		for (r, e) in expect.iter().enumerate() {
 			assert_eq!(g.of(r), *e, "row {r}");
+		}
+	}
+
+	/// Captures planned before their steps, made by the passes as they write the canvas, equal those converted after
+	/// the steps byte for byte, and the state stays the same: odd canvas sizes, rims that put block rows across the
+	/// bands, both stencils, every divisor and format, a mirror, emitters and an image source on the canvas's edges.
+	#[test]
+	fn a_planned_capture_equals_a_capture_after_the_step() {
+		use crate::engine::{ImageSource, SampleFormat};
+		let shape = |divisor, format, intensity_root| FrameShape {
+			canvas_width: 37,
+			canvas_height: 75,
+			divisor,
+			format,
+			field_brightness: 40.0,
+			intensity_brightness: 300.0,
+			intensity_root,
+		};
+		let shapes = [
+			shape(1, SampleFormat::Half, true),
+			shape(2, SampleFormat::Index, true),
+			shape(4, SampleFormat::Half, false),
+			shape(4, SampleFormat::Index, false),
+			shape(2, SampleFormat::Half, true),
+			shape(1, SampleFormat::Index, true),
+		];
+		let bits = |v: &[f32]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+		for stencil in [Stencil::NinePoint, Stencil::FourthOrder] {
+			for (rim, tracked) in [(0, true), (1, true), (2, false), (3, true), (5, true), (6, true)] {
+				let mut scene = SceneData::blank(37, 75, &Scene { damping_edge: -rim, ..Scene::default() });
+				let gw = scene.grid_width() as usize;
+				let r = rim as usize;
+				for x in 5..20 {
+					scene.c2[(r + 40) * gw + r + x] = 0.0;
+				}
+				scene.image_sources.push(ImageSource { gx: r as u32 + 36, gy: r as u32 + 33, level: 120 });
+				let build = || {
+					let mut e = CpuEngine::new(scene.clone(), options(stencil));
+					e.set_emitters(&[emitter(20, 15), emitter(3, 31), emitter(36, 74), emitter(0, 0), emitter(8, 63)]);
+					e.set_track_intensity(tracked);
+					e
+				};
+				let (mut fused, mut after) = (build(), build());
+				for step in 0..14 {
+					let shape = shapes[step % shapes.len()];
+					if step != 9 {
+						fused.plan_capture(&shape);
+					}
+					fused.advance_one_step();
+					after.advance_one_step();
+					assert_eq!(fused.captured.is_some(), step != 9);
+					if step == 11 {
+						continue;
+					}
+					let ask = if step == 7 { shapes[0] } else { shape };
+					let pending = fused.begin_capture(&ask, Snapshot::new(ask)).unwrap();
+					let got = fused.finish_capture(pending).unwrap();
+					let want = after.capture_frame(&ask);
+					let at = format!("{stencil:?} rim {rim} step {step}");
+					assert_eq!((got.shape, got.step), (want.shape, want.step), "{at}");
+					assert!(got.field == want.field, "field, {at}");
+					assert!(got.intensity == want.intensity, "intensity, {at}");
+					assert_eq!(got.intensity.is_empty(), !tracked);
+					for (a, b) in [
+						(&fused.u, &after.u),
+						(&fused.prev, &after.prev),
+						(&fused.s1, &after.s1),
+						(&fused.s2, &after.s2),
+					] {
+						assert!(bits(a) == bits(b), "state, {at}");
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn band_lengths_cover_the_grid_and_start_on_canvas_rows_of_four() {
+		for (gh, rim) in [(75, 0), (77, 1), (81, 3), (139, 32), (5, 2), (36, 0), (130, 33)] {
+			for band in [4, 32] {
+				let lens: Vec<usize> = band_lengths(gh, rim, band).collect();
+				assert_eq!(lens.iter().sum::<usize>(), gh);
+				assert!(lens.iter().all(|&n| n > 0));
+				let mut g = 0;
+				for &n in &lens[..lens.len() - 1] {
+					g += n;
+					assert!(g < rim || (g - rim) % 4 == 0, "gh {gh} rim {rim} band {band} at {g}");
+				}
+			}
 		}
 	}
 

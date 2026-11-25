@@ -78,6 +78,10 @@ pub trait WaveEngine: MaybeSend {
 	/// Natively it waits for the readings; on wasm32 the GPU engine fails with `GpuError::NotReady` if `pending`'s
 	/// `ready` has not resolved, which only a native wait could make impossible.
 	fn drain_probes(&mut self, pending: PendingProbes, f: &mut dyn FnMut(&ProbeReadings)) -> Result<(), EngineError>;
+	/// Announces a [`begin_capture`](Self::begin_capture) of `shape` right after the next step, so that the engine may
+	/// convert the canvas while that step writes it. A hint for the next step alone: the captured frame is the same
+	/// with or without it. The CPU engine honours it; the default ignores it.
+	fn plan_capture(&mut self, _shape: &FrameShape) {}
 	/// Starts converting the canvas (rim excluded) after the last step into planes of `shape`, written into
 	/// `into`'s planes (reused when large enough). The engine may step on before `finish_capture`
 	/// (`Self::finish_capture`) collects it; at most [`capture_capacity`](Self::capture_capacity) captures may be

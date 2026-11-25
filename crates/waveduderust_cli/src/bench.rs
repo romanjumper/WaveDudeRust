@@ -105,8 +105,12 @@ fn time_engine(engine: &mut dyn WaveEngine, shape: &FrameShape, steps: u32, capt
 	let mut captures = Captures { shape: *shape, pending: None, spare: Vec::new() };
 	let mut run = |engine: &mut dyn WaveEngine, count: u32| -> Result<()> {
 		for i in 1..=count {
+			let capture = captures_every > 0 && i % captures_every == 0;
+			if capture {
+				engine.plan_capture(shape);
+			}
 			engine.advance_one_step()?;
-			if captures_every > 0 && i % captures_every == 0 {
+			if capture {
 				captures.take(engine)?;
 			}
 		}

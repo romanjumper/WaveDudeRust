@@ -1175,8 +1175,14 @@ impl Worker {
 				&& i + 1 < steps
 				&& i.is_multiple_of(capture_every)
 				&& self.ready_to_capture(i / capture_every)?;
+			// The stored frame `step_to` captures after the last step, unless it is there.
+			let then = matches!(unit, Unit::Frame(j) if i + 1 == steps && !self.has_frame(j));
 			let probes = self.collector.is_some();
+			let shape = self.current().spec.shape;
 			let engine = self.engine();
+			if capturing || then {
+				engine.plan_capture(&shape);
+			}
 			engine.advance_one_step()?;
 			if probes {
 				engine.queue_probes()?;
@@ -2158,6 +2164,9 @@ mod tests {
 			self.drained = self.drained.max(end);
 			self.batches.retain(|&(_, e)| e > end);
 			Ok(())
+		}
+		fn plan_capture(&mut self, shape: &FrameShape) {
+			self.inner.plan_capture(shape);
 		}
 		fn begin_capture(
 			&mut self,

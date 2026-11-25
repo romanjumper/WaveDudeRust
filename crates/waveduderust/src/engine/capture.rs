@@ -41,48 +41,73 @@ const ROWS_PER_TASK: usize = 8;
 /// One plane of `layer` in the shape's format from canvas rows into `out` (resized to the plane, its allocation
 /// reused): `fill(y, row)` writes the `canvas_width` values of canvas row `y` (for the intensity I, not its
 /// root). Rows run in parallel in chunks, the block means, the root and the conversion share one pass over
-/// per-task scratch rows.
+/// per-task scratch rows ([`block_row`]).
 pub fn plane_rows(shape: &FrameShape, layer: Layer, out: &mut Vec<u8>, fill: impl Fn(usize, &mut [f32]) + Sync) {
 	let (w, h, div) = (shape.canvas_width as usize, shape.canvas_height as usize, shape.divisor as usize);
-	let (ow, oh) = (shape.width() as usize, shape.height() as usize);
-	let bytes = match shape.format {
-		SampleFormat::Half => 2,
-		SampleFormat::Index => 1,
-	};
-	out.resize(ow * oh * bytes, 0);
-	let root = shape.intensity_root && layer == Layer::Intensity;
-	out.par_chunks_mut(ow * bytes * ROWS_PER_TASK).enumerate().for_each_init(
+	let ow = shape.width() as usize;
+	out.resize(shape.plane_bytes(), 0);
+	out.par_chunks_mut(row_bytes(shape) * ROWS_PER_TASK).enumerate().for_each_init(
 		|| (vec![0f32; w * div], vec![0f32; ow]),
 		|(rows, means), (chunk, dst)| {
-			for (r, dst_row) in dst.chunks_exact_mut(ow * bytes).enumerate() {
+			for (r, dst_row) in dst.chunks_exact_mut(row_bytes(shape)).enumerate() {
 				let by = chunk * ROWS_PER_TASK + r;
 				let (y0, y1) = (by * div, ((by + 1) * div).min(h));
-				if div == 1 {
-					fill(y0, means);
-				} else {
-					for (k, y) in (y0..y1).enumerate() {
-						fill(y, &mut rows[k * w..(k + 1) * w]);
-					}
-					for (bx, v) in means.iter_mut().enumerate() {
-						let (x0, x1) = (bx * div, ((bx + 1) * div).min(w));
-						let mut sum = 0f32;
-						for k in 0..y1 - y0 {
-							for &s in &rows[k * w + x0..k * w + x1] {
-								sum += s;
-							}
-						}
-						*v = sum / ((y1 - y0) * (x1 - x0)) as f32;
-					}
+				for (k, y) in (y0..y1).enumerate() {
+					fill(y, &mut rows[k * w..(k + 1) * w]);
 				}
-				if root {
-					for v in means.iter_mut() {
-						*v = v.sqrt();
-					}
-				}
-				store_row(shape, layer, means, dst_row);
+				block_row(shape, layer, rows, w, y1 - y0, means, dst_row);
 			}
 		},
 	);
+}
+
+/// Bytes of one output row of a plane of `shape`.
+pub fn row_bytes(shape: &FrameShape) -> usize {
+	shape.width() as usize
+		* match shape.format {
+			SampleFormat::Half => 2,
+			SampleFormat::Index => 1,
+		}
+}
+
+/// One output row of a plane of `layer` into `dst` ([`row_bytes`]) from the `n` canvas rows of its blocks: row `k`
+/// is the `canvas_width` values from `rows[k * stride]` (for the intensity I, not its root). `means` is scratch of
+/// the plane's width. The block means, in row-major order, the root and the conversion of [`plane_rows`].
+pub fn block_row(
+	shape: &FrameShape,
+	layer: Layer,
+	rows: &[f32],
+	stride: usize,
+	n: usize,
+	means: &mut [f32],
+	dst: &mut [u8],
+) {
+	let (w, div) = (shape.canvas_width as usize, shape.divisor as usize);
+	let root = shape.intensity_root && layer == Layer::Intensity;
+	let means = &mut means[..shape.width() as usize];
+	if div == 1 {
+		if !root {
+			return store_row(shape, layer, &rows[..w], dst);
+		}
+		means.copy_from_slice(&rows[..w]);
+	} else {
+		for (bx, v) in means.iter_mut().enumerate() {
+			let (x0, x1) = (bx * div, ((bx + 1) * div).min(w));
+			let mut sum = 0f32;
+			for k in 0..n {
+				for &s in &rows[k * stride + x0..k * stride + x1] {
+					sum += s;
+				}
+			}
+			*v = sum / (n * (x1 - x0)) as f32;
+		}
+	}
+	if root {
+		for v in means.iter_mut() {
+			*v = v.sqrt();
+		}
+	}
+	store_row(shape, layer, means, dst);
 }
 
 /// Converts one row of f32 samples (already rooted for a root intensity) into the shape's format.

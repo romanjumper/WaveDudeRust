@@ -259,10 +259,27 @@ impl CpuPml {
 	/// Adds the rim's correction of `field` (times `scale c2`) to `out` and advances memory `set`.
 	/// `c2` per padded cell at the sub-step scale.
 	pub fn apply(&mut self, set: usize, field: &[f32], cuts: &[u8], c2: &[f32], out: &mut [f32], scale: f32) {
+		self.advance(set, field, cuts);
+		let Strips { gw, gh, rim } = self.strips;
+		let s = self.stride;
+		let rows =
+			out[PAD * s..(PAD + gh) * s].par_chunks_mut(s).map(move |line| split_row(&mut line[PAD..][..gw], rim));
+		self.correct::<true>(set, cuts, c2, rows, scale);
+	}
+
+	/// As [`apply`](Self::apply), but stores the corrections in `out` instead of adding them: `out` then holds per
+	/// rim cell the value `apply` adds.
+	pub fn apply_into(&mut self, set: usize, field: &[f32], cuts: &[u8], c2: &[f32], out: &mut RimCells, scale: f32) {
+		assert_eq!(out.strips, self.strips);
+		self.advance(set, field, cuts);
+		self.correct::<false>(set, cuts, c2, out.rows_mut(), scale);
+	}
+
+	/// Advances memory `set` but for xi of x, which [`correct`](Self::correct) advances.
+	fn advance(&mut self, set: usize, field: &[f32], cuts: &[u8]) {
 		self.psi_y(set, field, cuts);
 		self.delta_y(set, field, cuts);
 		self.psi_x(set, field, cuts);
-		self.correct(set, cuts, c2, out, scale);
 	}
 
 	fn z_width(rim: usize) -> usize {
@@ -363,21 +380,29 @@ impl CpuPml {
 		self.z = z;
 	}
 
-	fn correct(&mut self, set: usize, cuts: &[u8], c2: &[f32], out: &mut [f32], scale: f32) {
+	/// Puts the corrections into `rows`, per grid row its cells left of, between and right of the x strips
+	/// ([`split_row`]; only the y strips' rows take those between): adds them when `ADD`, else stores them.
+	fn correct<'a, const ADD: bool>(
+		&mut self,
+		set: usize,
+		cuts: &[u8],
+		c2: &[f32],
+		rows: impl IndexedParallelIterator<Item = [&'a mut [f32]; 3]>,
+		scale: f32,
+	) {
 		let strips = self.strips;
-		let Strips { gw, gh, rim } = strips;
+		let Strips { gw, rim, .. } = strips;
 		let (s, zw) = (self.stride, Self::z_width(rim));
 		let mut memory = std::mem::take(&mut self.xi[set]);
 		let (xi_x, rest) = memory.split_at_mut(strips.x_len());
 		let delta = &rest[strips.len() - strips.x_len()..];
 		let (pml, psi) = (&*self, &self.psi[set][..strips.x_len()]);
-		let rows = &mut out[PAD * s..(PAD + gh) * s];
 		let right_start = gw - rim;
-		rows.par_chunks_mut(s).zip(xi_x.par_chunks_mut(2 * rim)).enumerate().for_each_init(
+		rows.zip(xi_x.par_chunks_mut(2 * rim)).enumerate().for_each_init(
 			|| vec![0.0f32; rim + 4],
-			|padded, (gy, (line, xi_x))| {
+			|padded, (gy, ([line_l, line_mid, line_r], xi_x))| {
 				let base = (gy + PAD) * s + PAD;
-				let (line, c2) = (&mut line[PAD..][..gw], &c2[base..][..gw]);
+				let c2 = &c2[base..][..gw];
 				let (zl, zr) = pml.z[gy * zw..][..zw].split_at(rim + 6);
 				let (pl, pr) = psi[gy * 2 * rim..][..2 * rim].split_at(rim);
 				let (xl, xr) = xi_x.split_at_mut(rim);
@@ -388,8 +413,6 @@ impl CpuPml {
 					x: &pml.x[g0..][..rim],
 					c2: &c2[g0..][..rim],
 				});
-				let (line_l, rest) = line.split_at_mut(rim);
-				let (line_mid, line_r) = rest.split_at_mut(right_start - rim);
 				match Self::strip_row(strips, gy).map(|r| &delta[r * gw..][..gw]) {
 					Some(d) => {
 						let cross = pml.cross;
@@ -403,15 +426,15 @@ impl CpuPml {
 							}
 							sum
 						};
-						pml.correct_span(&left, xl, line_l, padded, scale, plain);
-						pml.correct_span(&right, xr, line_r, padded, scale, |k| plain(right_start + k));
+						pml.correct_span::<ADD>(&left, xl, line_l, padded, scale, plain);
+						pml.correct_span::<ADD>(&right, xr, line_r, padded, scale, |k| plain(right_start + k));
 						for (k, v) in line_mid.iter_mut().enumerate() {
-							*v += scale * c2[rim + k] * plain(rim + k);
+							put::<ADD>(v, scale * c2[rim + k] * plain(rim + k));
 						}
 					}
 					None => {
-						pml.correct_span(&left, xl, line_l, padded, scale, |_| 0.0);
-						pml.correct_span(&right, xr, line_r, padded, scale, |_| 0.0);
+						pml.correct_span::<ADD>(&left, xl, line_l, padded, scale, |_| 0.0);
+						pml.correct_span::<ADD>(&right, xr, line_r, padded, scale, |_| 0.0);
 					}
 				}
 			},
@@ -419,9 +442,9 @@ impl CpuPml {
 		self.xi[set] = memory;
 	}
 
-	/// Adds `scale c2 (init + O_x z~ - D2x z~)` to the cells `line` of one x strip of a row and advances their
-	/// xi; `padded` holds at least the strip's psi and two zeros each side.
-	fn correct_span(
+	/// Adds `scale c2 (init + O_x z~ - D2x z~)` to the cells `line` of one x strip of a row (stores it when not
+	/// `ADD`) and advances their xi; `padded` holds at least the strip's psi and two zeros each side.
+	fn correct_span<const ADD: bool>(
 		&self,
 		span: &XSpan<'_>,
 		xi: &mut [f32],
@@ -431,14 +454,14 @@ impl CpuPml {
 		init: impl Fn(usize) -> f32,
 	) {
 		if any_cut(span.cut, cut::X_SHIFT) {
-			self.correct_cells::<true>(span, xi, line, padded, scale, init);
+			self.correct_cells::<true, ADD>(span, xi, line, padded, scale, init);
 		} else {
-			self.correct_cells::<false>(span, xi, line, padded, scale, init);
+			self.correct_cells::<false, ADD>(span, xi, line, padded, scale, init);
 		}
 	}
 
 	#[inline(always)]
-	fn correct_cells<const CUT: bool>(
+	fn correct_cells<const CUT: bool, const ADD: bool>(
 		&self,
 		span: &XSpan<'_>,
 		xi: &mut [f32],
@@ -455,8 +478,72 @@ impl CpuPml {
 			let dpsi = (8.0 * (padded[k + 3] - padded[k + 1]) - (padded[k + 4] - padded[k])) / 12.0;
 			let taps = maybe_cut::<CUT>(window(z, k), cut[k] >> cut::X_SHIFT);
 			let sum = init(k) + stretched(&taps, &self.axis, x[k], dpsi, &mut xi[k]);
-			line[k] += scale * c2[k] * sum;
+			put::<ADD>(&mut line[k], scale * c2[k] * sum);
 		}
+	}
+}
+
+/// `*cell += v` when `ADD`, else `*cell = v`.
+#[inline(always)]
+fn put<const ADD: bool>(cell: &mut f32, v: f32) {
+	if ADD {
+		*cell += v;
+	} else {
+		*cell = v;
+	}
+}
+
+/// A grid row's `gw` cells split at the x strips of `rim` cells: left strip, between, right strip.
+fn split_row(line: &mut [f32], rim: usize) -> [&mut [f32]; 3] {
+	let right = line.len() - rim;
+	let (left, rest) = line.split_at_mut(rim);
+	let (mid, right) = rest.split_at_mut(right - rim);
+	[left, mid, right]
+}
+
+/// One value per rim cell by grid row: the rows of the y strips whole, the x strips' cells of the rows between
+/// ([`CpuPml::apply_into`]).
+pub struct RimCells {
+	strips: Strips,
+	values: Vec<f32>,
+}
+
+impl RimCells {
+	pub fn new(strips: Strips) -> Self {
+		Self { strips, values: vec![0.0; strips.rim_cells()] }
+	}
+
+	/// The values of grid row `gy`'s cells left of, between and right of the x strips; between is empty off
+	/// the y strips.
+	pub fn row(&self, gy: usize) -> [&[f32]; 3] {
+		let Strips { gw, gh, rim } = self.strips;
+		let (top, between) = (rim * gw, (gh - 2 * rim) * 2 * rim);
+		let whole = |at: usize| {
+			let line = &self.values[at..][..gw];
+			[&line[..rim], &line[rim..gw - rim], &line[gw - rim..]]
+		};
+		if gy < rim {
+			whole(gy * gw)
+		} else if gy >= gh - rim {
+			whole(top + between + (gy + rim - gh) * gw)
+		} else {
+			let line = &self.values[top + (gy - rim) * 2 * rim..][..2 * rim];
+			[&line[..rim], &[], &line[rim..]]
+		}
+	}
+
+	/// Every grid row's values as [`row`](Self::row) splits them, in order.
+	fn rows_mut(&mut self) -> impl IndexedParallelIterator<Item = [&mut [f32]; 3]> {
+		let Strips { gw, gh, rim } = self.strips;
+		let (top, rest) = self.values.split_at_mut(rim * gw);
+		let (between, bottom) = rest.split_at_mut((gh - 2 * rim) * 2 * rim);
+		top.par_chunks_mut(gw)
+			.map(move |line| split_row(line, rim))
+			.chain(between.par_chunks_mut(2 * rim).map(move |line| {
+				let (left, right) = line.split_at_mut(rim);
+				[left, Default::default(), right]
+			}))
+			.chain(bottom.par_chunks_mut(gw).map(move |line| split_row(line, rim)))
 	}
 }
 
@@ -579,6 +666,38 @@ mod tests {
 		}
 		assert!(seen.iter().all(|&n| n == 1));
 		assert_eq!(rim, st.rim_cells());
+	}
+
+	#[test]
+	fn stored_corrections_are_those_apply_adds() {
+		let scene = SceneData::blank(12, 9, &Scene { damping_edge: -4, ..Scene::default() });
+		let strips = Strips::of(&scene);
+		let (s, cells) = (scene.stride(), scene.padded_cells());
+		let field: Vec<f32> = (0..cells).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+		let c2: Vec<f32> = (0..cells).map(|i| 0.1 + (i % 7) as f32 * 0.01).collect();
+		let cuts = vec![0u8; cells];
+		let axis = super::super::stencil::StencilCoefficients::DRP.axis.map(|a| a as f32);
+		let (mut a, mut b) = (CpuPml::new(&scene, 2, axis, 0.0).unwrap(), CpuPml::new(&scene, 2, axis, 0.0).unwrap());
+		let mut added = vec![0.0f32; cells];
+		let mut stored = RimCells::new(strips);
+		for _ in 0..3 {
+			added.fill(0.0);
+			a.apply(0, &field, &cuts, &c2, &mut added, 1.0);
+			b.apply_into(0, &field, &cuts, &c2, &mut stored, 1.0);
+			let mut seen = 0;
+			for gy in 0..strips.gh {
+				let row = &added[(gy + PAD) * s + PAD..][..strips.gw];
+				let [left, mid, right] = stored.row(gy);
+				let mut expect = vec![0.0f32; strips.gw];
+				expect[..left.len()].copy_from_slice(left);
+				expect[left.len()..][..mid.len()].copy_from_slice(mid);
+				expect[strips.gw - right.len()..].copy_from_slice(right);
+				assert_eq!(row, &expect[..], "row {gy}");
+				seen += left.len() + mid.len() + right.len();
+			}
+			assert_eq!(seen, strips.rim_cells());
+			assert!(added.iter().any(|&v| v != 0.0));
+		}
 	}
 
 	#[test]

@@ -33,9 +33,11 @@ Leapfrog is second order in time, explicit, time-reversible and
 non-dissipative (Taflove & Hagness, ch. 2 and 4; LeVeque, ch. 10). The
 modified equation (Dablain 1986) cancels leapfrog's leading temporal error
 `dt^4 u_tttt / 12` through `u_tttt = (c^2 L)^2 u`, so time is 4th order like
-space. The engine evaluates it in two passes over the grid: `w = c2 L u`, then
-`u+ = u + ((u - u-) d + (w + c2 L w / 12) h)`, one extra Laplacian and one
-scratch buffer `w` ([engine/cpu.rs](../crates/waveduderust/src/engine/cpu.rs), [engine/stencil.rs](../crates/waveduderust/src/engine/stencil.rs)); d and h are the
+space. The engines evaluate `w = c2 L u`, then
+`u+ = u + ((u - u-) d + (w + c2 L w / 12) h)`, one extra Laplacian: the GPU
+engine in two passes over the grid with one scratch buffer `w`, the CPU engine
+in one pass over bands of rows, each band keeping its `w` rows in a small
+buffer ([engine/cpu.rs](../crates/waveduderust/src/engine/cpu.rs), [engine/stencil.rs](../crates/waveduderust/src/engine/stencil.rs)); d and h are the
 damping's (below).
 
 Damping. A cell of damping factor d per sub-step (`d^(1/n)` of the scene's d

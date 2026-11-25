@@ -284,6 +284,56 @@ the release binary's disassembly in both forms, constants and maps. The hashes o
 intensity stages and two captures every 50 of 300 steps of nine projects (mirrors, both stencils, Mur and reflective
 edges, many media, many sources, a 3060x1260 lens) are bit for bit the same before and after.
 
+## The CPU engine's banded 4th-order pass
+
+The 4th-order sub-step of the CPU engine (`crates/waveduderust/src/engine/cpu.rs`, `modified_pass`) is one parallel pass
+over bands of 32 grid rows instead of a pass writing `w = c2 L u` over the whole grid and a second reading it. Each band
+computes its `w` rows, 3 rows either side included, into a buffer of its rayon job (`for_each_init`), each row just
+before the first next row that reads it, so `w` stays in the cache; the 3 rows either side are computed by both
+neighbours. The CPML's first application stores its corrections in a rim-sized buffer (`pml.rs`, `RimCells`,
+`CpuPml::apply_into`), which the band adds to `w` before the forcing, as before; the cells of `w` within `rim + 3` cells
+of the grid's edge, which the second application reads, go to a grid-sized plane (only with a rim). Bands of 16 rows
+were about as fast on 8 threads, 64, 128 and 256 slower (18 bands or fewer on 8 threads; 10.3 to 10.7 against 9.0 to 9.1
+ms on the blank canvas, rim 32), and no height was faster on one thread; about 4 bands a thread was no better than 32
+rows.
+
+2026-11-25, the VirtualBox guest above (Ryzen 7 4700U, 8 vCPUs), before (0823d47) and after, alternated, two runs
+each; 10a6a02, before the medium runs, for reference. Blank scene, 4th order, ms a step: `RAYON_NUM_THREADS=<n>
+waveduderust-cli bench --width 1920 --height 1080 --rim <0|32> --stencil fourth --captures-every <0|2> --steps 200`
+(the rows without captures from the runs with `--captures-every 0`, with captures every 2 steps the bench's second
+row):
+
+| Rim, captures, threads | 10a6a02 | Before | After |
+|---|---|---|---|
+| 0, none, 1 | 17.1 to 19.1 | 14.8 to 21.0 | 14.6 to 16.0 |
+| 0, every 2, 1 | 17.7 to 19.0 | 16.6 to 16.8 | 15.9 to 16.9 |
+| 32, none, 1 | 24.1 to 24.6 | 22.8 to 23.6 | 23.4 to 24.4 |
+| 32, every 2, 1 | 27.9 to 28.5 | 25.5 to 25.7 | 25.4 to 25.7 |
+| 0, none, 8 | 10.0 to 10.8 | 7.94 to 8.12 | 5.52 to 5.59 |
+| 0, every 2, 8 | 10.9 | 8.60 to 12.0 | 6.09 to 6.84 |
+| 32, none, 8 | 11.7 to 19.0 | 10.0 to 13.1 | 7.76 to 8.37 |
+| 32, every 2, 8 | 12.9 to 13.1 | 10.7 to 12.0 | 8.85 to 8.86 |
+
+Example projects as saved (4th order), seconds for `RAYON_NUM_THREADS=<n> /usr/bin/time -f %e waveduderust-cli
+probes --out <dir> --steps 300 <project>`:
+
+| Project, threads | Before | After |
+|---|---|---|
+| Example01, 1 | 5.51 to 5.54 | 5.61 to 5.63 |
+| Example13, 1 | 7.51 to 7.55 | 7.02 to 7.15 |
+| Example21, 1 | 19.7 to 20.9 | 20.3 to 21.0 |
+| Example01, 8 | 2.40 to 2.47 | 2.38 to 2.46 |
+| Example13, 8 | 3.12 to 3.13 | 2.37 to 2.58 |
+| Example21, 8 | 8.90 to 8.95 | 8.20 to 8.22 |
+
+On 8 threads, where the passes are bound by the memory's bandwidth, the blank canvas gains 17 to 30 % (17 % with rim 32
+and captures every 2 steps), Example13 and Example21 8 to 25 %; Example01 (a small canvas) gains nothing measurable.
+On one thread Example13 is 5 to 7 % faster (7.51 to 7.55 s before, 7.02 to 7.15 after) and Example01 about 1.5 %
+slower (5.51 to 5.54 s, 5.61 to 5.63); the rest is within the guest's noise (Example21 took 19.7 to 20.9 s before in
+four runs, 20.3 to 21.0 after). The hashes of the field, the
+previous field, the intensity stages and two captures every 50 of 300 steps of nine projects (mirrors, both stencils,
+Mur and reflective edges, many media, many sources, a 3060x1260 lens) are bit for bit the same before and after.
+
 ## Other operations
 
 2026-11-06 unless noted.

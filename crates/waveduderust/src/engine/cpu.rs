@@ -11,11 +11,13 @@
 //! for a smooth field (Sterbenz), so round-off scales with the result and the weights sum to 0 exactly. Summing
 //! the taps first biases the 9-point's energy (docs/physics.md, Energy).
 //!
-//! The 9-point sub-step is one leapfrog pass: `next = u + ((u - prev) d + c2 L u)`. The 4th-order (DRP) stencil is
-//! two passes, `w = c2 L u`, then `next = u + ((u - prev) d + (w + c2 L w / 12))` (stencil.rs); `next` is written
-//! over `prev`. With a rim, the CPML corrects the rim after each pass (pml.rs).
+//! The 9-point sub-step is one leapfrog pass: `next = u + ((u - prev) d + c2 L u)`. The 4th-order (DRP) stencil
+//! applies the operator twice, `w = c2 L u`, then `next = u + ((u - prev) d + (w + c2 L w / 12))` (stencil.rs), in
+//! one pass over bands of rows that keeps each band's `w` in a small buffer (`modified_pass`); `next` is written
+//! over `prev`. With a rim, the CPML corrects the rim after each application (pml.rs).
 //!
-//! Threads: one driver thread; each pass fans out over rows on the rayon pool, reading only its input field.
+//! Threads: one driver thread; each pass fans out over rows or bands on the rayon pool, reading only its input
+//! field.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -25,7 +27,7 @@ use rayon::prelude::*;
 use super::capture;
 use super::forcing::{IMAGE_LEVELS, SourceGroups, live};
 use super::mur::{MurChain, mur_chains};
-use super::pml::{self, CpuPml, cut, taps};
+use super::pml::{self, CpuPml, RimCells, cut, taps};
 use super::shared::{Shared, blend};
 use super::stencil::{INV12, K9_AXIS, K9_DIAGONAL, PAD, StencilCoefficients, TimeScheme, centred};
 use super::substeps::sub_steps;
@@ -53,14 +55,20 @@ pub struct CpuEngine {
 	mirrors: bool,
 	u: Vec<f32>,
 	prev: Vec<f32>,
-	/// The modified equation's `c2 L u`, 0 on the padding.
+	/// The modified equation's `c2 L u` on the cells the CPML's second application reads: each sub-step writes only
+	/// the cells within `rim + 3` of the grid's edge ([`rim_w`]), the rest stay 0, so it is not a full plane of `w`.
+	/// Empty without a rim.
 	w: Vec<f32>,
+	/// The CPML's corrections of `w`; empty without a rim.
+	corrections: Option<RimCells>,
 	/// The intensity's EMA stages; empty unless the intensity is tracked.
 	s1: Vec<f32>,
 	s2: Vec<f32>,
 	mur: Vec<MurChain>,
 	pml: Option<CpuPml>,
 	groups: SourceGroups,
+	/// `groups` by padded row.
+	group_rows: GroupRows,
 	/// The source table of the current sub-step (forcing.rs).
 	values: Vec<f32>,
 	alpha: f32,
@@ -74,11 +82,12 @@ pub struct CpuEngine {
 /// mirror cuts and the CPML's auxiliary fields.
 pub fn grid_bytes(scene: &SceneData, options: &EngineOptions) -> u64 {
 	let cells = scene.padded_cells() as u64;
-	let modified = TimeScheme::of(options.stencil) == TimeScheme::ModifiedEquation;
-	let planes = 4 + u64::from(modified) + 2 * u64::from(options.track_intensity);
 	let strips = pml::Strips::of(scene);
+	let modified = TimeScheme::of(options.stencil) == TimeScheme::ModifiedEquation && !strips.is_empty();
+	let planes = 4 + u64::from(modified) + 2 * u64::from(options.track_intensity);
 	let (psi, xi) = (strips.len() as u64, (strips.len() + strips.y_len()) as u64);
-	cells * (4 * planes + 1) + 2 * 4 * (psi + xi)
+	let corrections = if modified { strips.rim_cells() as u64 } else { 0 };
+	cells * (4 * planes + 1) + 2 * 4 * (psi + xi) + 4 * corrections
 }
 
 impl CpuEngine {
@@ -96,7 +105,6 @@ impl CpuEngine {
 		let scene = scene.into();
 		let stride = scene.stride();
 		let cells = scene.padded_cells();
-		let scheme = TimeScheme::of(options.stencil);
 		let stages = if options.track_intensity { cells } else { 0 };
 		let mut engine = Self {
 			stride,
@@ -108,12 +116,14 @@ impl CpuEngine {
 			mirrors: false,
 			u: vec![0.0; cells],
 			prev: vec![0.0; cells],
-			w: if scheme == TimeScheme::ModifiedEquation { vec![0.0; cells] } else { Vec::new() },
+			w: Vec::new(),
+			corrections: None,
 			s1: vec![0.0; stages],
 			s2: vec![0.0; stages],
 			mur: Vec::new(),
 			pml: None,
 			groups: SourceGroups::default(),
+			group_rows: GroupRows::default(),
 			values: vec![0.0; IMAGE_LEVELS],
 			alpha: 0.0,
 			probes: Vec::new(),
@@ -217,6 +227,9 @@ impl CpuEngine {
 		self.mur = mur_chains(scene, &self.c2, &self.d);
 		let cross = StencilCoefficients::of(self.shared.options.stencil).cross as f32;
 		self.pml = CpuPml::new(scene, n, self.axis, cross);
+		let rim = self.pml.is_some() && self.shared.scheme == TimeScheme::ModifiedEquation;
+		self.w = if rim { vec![0.0; self.u.len()] } else { Vec::new() };
+		self.corrections = rim.then(|| RimCells::new(pml::Strips::of(scene)));
 		self.group_sources();
 	}
 
@@ -226,22 +239,8 @@ impl CpuEngine {
 
 	fn group_sources(&mut self) {
 		self.groups = self.shared.groups();
+		self.group_rows = GroupRows::new(&self.groups.cells, self.stride, self.u.len() / self.stride);
 		self.values.resize(self.shared.sources.table_len(), 0.0);
-	}
-
-	/// Adds the sub-step's forcing `F` to `w` at the driven cells, where the modified equation takes
-	/// `A u` (forcing.rs).
-	fn force_w(&mut self) {
-		for (cell, run) in self.groups.iter() {
-			let mut v = self.w[cell];
-			for &e in run {
-				let f = self.values[e as usize];
-				if live(f) {
-					v += f;
-				}
-			}
-			self.w[cell] = v;
-		}
 	}
 
 	/// Adds `h F` to the next field at the driven cells, where leapfrog takes `h A u`, and moves the
@@ -301,52 +300,54 @@ impl CpuEngine {
 		});
 	}
 
-	/// The modified equation's first pass: `w = c2 L u` on every grid cell.
-	fn inner_pass(&mut self) {
-		let (s, gw) = (self.stride, self.shared.scene.grid_width() as usize);
-		let (u, c2, runs, cuts, axis, mirrors) = (&self.u, &self.c2, &self.runs, &self.cuts, &self.axis, self.mirrors);
-		grid_rows(&mut self.w, None, s, gw, |r, w| {
-			let at = r * s + PAD;
-			runs.of_row(r, row_cuts(cuts, mirrors, at, gw), |cells, medium, cuts| {
-				let (at, len, w) = (at + cells.start, cells.len(), &mut w[cells.clone()]);
-				match medium {
-					Some(m) => drp_row(u, at, s, len, axis, cuts, |x, lap| w[x] = m.c2 * lap),
-					None => {
-						let c2 = &c2[at..][..len];
-						drp_row(u, at, s, len, axis, cuts, |x, lap| w[x] = c2[x] * lap);
-					}
-				}
-			});
-		});
-	}
-
-	/// The modified equation's second pass: writes the next field over `prev`, and the intensity
-	/// stages when `intensity`.
-	fn outer_pass(&mut self, intensity: bool) {
-		let (s, gw) = (self.stride, self.shared.scene.grid_width() as usize);
-		let (u, w, c2, d, runs, cuts, axis, mirrors) =
-			(&self.u, &self.w, &self.c2, &self.d, &self.runs, &self.cuts, &self.axis, self.mirrors);
+	/// The modified equation's pass: writes the next field over `prev`, and the intensity stages when `intensity`.
+	/// Each band of [`BAND`] grid rows computes its `w` with 3 rows each side into a buffer of its job
+	/// ([`Modified::w_row`]), each `w` row just before the first next row that reads it, so `w` stays in cache;
+	/// the rows on either side are computed by both bands, from the same inputs. The cells the CPML's second
+	/// application reads go to `w` ([`rim_w`]).
+	fn modified_pass(&mut self, intensity: bool) {
+		let scene = &self.shared.scene;
+		let (s, gw, gh) = (self.stride, scene.grid_width() as usize, scene.grid_height() as usize);
+		let pass = Modified {
+			u: &self.u,
+			c2: &self.c2,
+			d: &self.d,
+			runs: &self.runs,
+			cuts: &self.cuts,
+			mirrors: self.mirrors,
+			axis: &self.axis,
+			corrections: self.corrections.as_ref(),
+			groups: &self.groups,
+			group_rows: &self.group_rows,
+			values: &self.values,
+			s,
+			gw,
+			gh,
+			rim: scene.rim as usize,
+		};
+		let grid = PAD * s..(PAD + gh) * s;
+		let n = BAND * s;
 		let stages = Self::stages(&mut self.s1, &mut self.s2, self.alpha, intensity);
-		grid_rows(&mut self.prev, stages, s, gw, |r, next| {
-			let at = r * s + PAD;
-			runs.of_row(r, row_cuts(cuts, mirrors, at, gw), |cells, medium, cuts| {
-				let (at, len, next) = (at + cells.start, cells.len(), &mut next[cells.clone()]);
-				let (uc, wc) = (&u[at..][..len], &w[at..][..len]);
-				match medium {
-					Some(m) => drp_row(w, at, s, len, axis, cuts, |x, lw| {
-						let c = uc[x];
-						next[x] = c + ((c - next[x]) * m.d + (wc[x] + m.c2 * lw * INV12) * m.centred);
-					}),
-					None => {
-						let (c2, d) = (&c2[at..][..len], &d[at..][..len]);
-						drp_row(w, at, s, len, axis, cuts, |x, lw| {
-							let c = uc[x];
-							next[x] = c + ((c - next[x]) * d[x] + (wc[x] + c2[x] * lw * INV12) * centred(d[x]));
-						});
-					}
-				}
-			});
-		});
+		let alpha = stages.as_ref().map_or(0.0, |st| st.alpha);
+		let (mut s1, mut s2) = match stages {
+			Some(Stages { s1, s2, .. }) => (Some(s1[grid.clone()].chunks_mut(n)), Some(s2[grid.clone()].chunks_mut(n))),
+			None => (None, None),
+		};
+		let mut w = (!self.w.is_empty()).then(|| self.w[grid.clone()].chunks_mut(n));
+		fn take<'a>(c: &mut Option<std::slice::ChunksMut<'a, f32>>) -> Option<&'a mut [f32]> {
+			c.as_mut().and_then(Iterator::next)
+		}
+		let bands: Vec<Band<'_>> = self.prev[grid]
+			.chunks_mut(n)
+			.enumerate()
+			.map(|(k, next)| Band {
+				r0: PAD + k * BAND,
+				next,
+				stages: take(&mut s1).zip(take(&mut s2)),
+				w: take(&mut w),
+			})
+			.collect();
+		bands.into_par_iter().for_each_init(Vec::new, |buffer, band| pass.band(band, buffer, alpha));
 	}
 
 	/// One sub-step; the next field ends in `u`.
@@ -360,12 +361,10 @@ impl CpuEngine {
 				self.force_next(intensity);
 			}
 			TimeScheme::ModifiedEquation => {
-				self.inner_pass();
-				if let Some(p) = &mut self.pml {
-					p.apply(0, &self.u, &self.cuts, &self.c2, &mut self.w, 1.0);
+				if let (Some(p), Some(out)) = (&mut self.pml, &mut self.corrections) {
+					p.apply_into(0, &self.u, &self.cuts, &self.c2, out, 1.0);
 				}
-				self.force_w();
-				self.outer_pass(intensity);
+				self.modified_pass(intensity);
 				if let Some(p) = &mut self.pml {
 					p.apply(1, &self.w, &self.cuts, &self.c2, &mut self.prev, INV12);
 				}
@@ -427,6 +426,179 @@ fn grid_rows(out: &mut [f32], stages: Option<Stages<'_>>, s: usize, gw: usize, r
 			.enumerate()
 			.filter(|(r, _)| grid(*r))
 			.for_each(|(r, line)| row(r, &mut line[PAD..][..gw])),
+	}
+}
+
+/// Grid rows of a band of [`CpuEngine::modified_pass`]: each band computes 6 rows of `w` twice, and its `w`
+/// buffer of `BAND + 6` rows should stay in the core's cache.
+const BAND: usize = 32;
+
+/// A band of [`CpuEngine::modified_pass`]: its first padded row, its rows of `prev`, of the intensity stages
+/// when they advance, and of `w` with a rim.
+struct Band<'a> {
+	r0: usize,
+	next: &'a mut [f32],
+	stages: Option<(&'a mut [f32], &'a mut [f32])>,
+	w: Option<&'a mut [f32]>,
+}
+
+/// The inputs of [`CpuEngine::modified_pass`].
+struct Modified<'a> {
+	u: &'a [f32],
+	c2: &'a [f32],
+	d: &'a [f32],
+	runs: &'a MediumRuns,
+	cuts: &'a [u8],
+	mirrors: bool,
+	axis: &'a [f32; 4],
+	corrections: Option<&'a RimCells>,
+	groups: &'a SourceGroups,
+	group_rows: &'a GroupRows,
+	values: &'a [f32],
+	s: usize,
+	gw: usize,
+	gh: usize,
+	rim: usize,
+}
+
+impl Modified<'_> {
+	/// Runs `band` with `buffer` for its `w` rows; `alpha` the intensity's EMA weight.
+	fn band(&self, band: Band<'_>, buffer: &mut Vec<f32>, alpha: f32) {
+		let Band { r0, next, mut stages, mut w } = band;
+		let (s, gw) = (self.s, self.gw);
+		let h = next.len() / s;
+		if buffer.len() < (h + 6) * s {
+			buffer.resize((h + 6) * s, 0.0);
+		}
+		// buffer row k holds w of padded row r0 - 3 + k
+		let buffer = &mut buffer[..(h + 6) * s];
+		for k in 0..6 {
+			self.w_row(r0 - 3 + k, &mut buffer[k * s..][..s]);
+		}
+		for k in 0..h {
+			let r = r0 + k;
+			self.w_row(r + 3, &mut buffer[(k + 6) * s..][..s]);
+			if let Some(w) = &mut w {
+				rim_w(&buffer[(k + 3) * s..][..s], &mut w[k * s..][..s], r - PAD, gw, self.gh, self.rim);
+			}
+			let line = &mut next[k * s + PAD..][..gw];
+			self.next_row(r, buffer, (k + 3) * s + PAD, line);
+			if let Some((s1, s2)) = &mut stages {
+				accumulate(&mut s1[k * s + PAD..][..gw], &mut s2[k * s + PAD..][..gw], line, alpha);
+			}
+		}
+	}
+
+	/// `w = c2 L u` of padded row `q` into `out` (`s` values, 0 on the padding and off the grid), then the CPML's
+	/// corrections and the sub-step's forcing `F` at the driven cells, where the modified equation takes `A u`
+	/// (forcing.rs).
+	fn w_row(&self, q: usize, out: &mut [f32]) {
+		let (u, c2, s, gw, axis) = (self.u, self.c2, self.s, self.gw, self.axis);
+		if !(PAD..PAD + self.gh).contains(&q) {
+			out.fill(0.0);
+			return;
+		}
+		out[..PAD].fill(0.0);
+		out[PAD + gw..].fill(0.0);
+		let line = &mut out[PAD..][..gw];
+		let at = q * s + PAD;
+		self.runs.of_row(q, row_cuts(self.cuts, self.mirrors, at, gw), |cells, medium, cuts| {
+			let (at, len, w) = (at + cells.start, cells.len(), &mut line[cells.clone()]);
+			match medium {
+				Some(m) => drp_row(u, at, s, len, axis, cuts, |x, lap| w[x] = m.c2 * lap),
+				None => {
+					let c2 = &c2[at..][..len];
+					drp_row(u, at, s, len, axis, cuts, |x, lap| w[x] = c2[x] * lap);
+				}
+			}
+		});
+		if let Some(corrections) = self.corrections {
+			let [left, mid, right] = corrections.row(q - PAD);
+			for (from, c) in [(0, left), (left.len(), mid), (gw - right.len(), right)] {
+				for (w, &c) in line[from..][..c.len()].iter_mut().zip(c) {
+					*w += c;
+				}
+			}
+		}
+		for &g in self.group_rows.of(q) {
+			let g = g as usize;
+			let (start, len) = self.groups.runs[g];
+			let x = self.groups.cells[g] - at;
+			let mut v = line[x];
+			for &e in &self.groups.entries[start as usize..][..len as usize] {
+				let f = self.values[e as usize];
+				if live(f) {
+					v += f;
+				}
+			}
+			line[x] = v;
+		}
+	}
+
+	/// The next field of padded row `r` over `next` (its grid cells of `prev`) from `w`, whose row's grid cells
+	/// start at `w_at`.
+	fn next_row(&self, r: usize, w: &[f32], w_at: usize, next: &mut [f32]) {
+		let (u, c2, d, s, gw, axis) = (self.u, self.c2, self.d, self.s, self.gw, self.axis);
+		let at = r * s + PAD;
+		self.runs.of_row(r, row_cuts(self.cuts, self.mirrors, at, gw), |cells, medium, cuts| {
+			let (at, w_at, len, next) = (at + cells.start, w_at + cells.start, cells.len(), &mut next[cells.clone()]);
+			let (uc, wc) = (&u[at..][..len], &w[w_at..][..len]);
+			match medium {
+				Some(m) => drp_row(w, w_at, s, len, axis, cuts, |x, lw| {
+					let c = uc[x];
+					next[x] = c + ((c - next[x]) * m.d + (wc[x] + m.c2 * lw * INV12) * m.centred);
+				}),
+				None => {
+					let (c2, d) = (&c2[at..][..len], &d[at..][..len]);
+					drp_row(w, w_at, s, len, axis, cuts, |x, lw| {
+						let c = uc[x];
+						next[x] = c + ((c - next[x]) * d[x] + (wc[x] + c2[x] * lw * INV12) * centred(d[x]));
+					});
+				}
+			}
+		});
+	}
+}
+
+/// Copies the cells of padded row `from` (of grid row `gy`) that the CPML's second application reads to `to`:
+/// those within `rim + 3` cells of the grid's edge (the x strips and the y strips with the stencil's reach).
+fn rim_w(from: &[f32], to: &mut [f32], gy: usize, gw: usize, gh: usize, rim: usize) {
+	let e = rim + 3;
+	if gy < e || gy + e >= gh || 2 * e >= gw {
+		to.copy_from_slice(from);
+		return;
+	}
+	to[PAD..][..e].copy_from_slice(&from[PAD..][..e]);
+	to[PAD + gw - e..][..e].copy_from_slice(&from[PAD + gw - e..][..e]);
+}
+
+/// The source groups by padded row: per row the indices of its groups ([`SourceGroups`]).
+#[derive(Default)]
+struct GroupRows {
+	groups: Vec<u32>,
+	/// The first entry of each padded row in `groups`, then their number.
+	rows: Vec<usize>,
+}
+
+impl GroupRows {
+	/// The rows of groups at padded `cells` on `rows` rows of `s`.
+	fn new(cells: &[usize], s: usize, rows: usize) -> Self {
+		let mut groups: Vec<u32> = (0..cells.len() as u32).collect();
+		groups.sort_by_key(|&g| cells[g as usize]);
+		let mut starts = Vec::with_capacity(rows + 1);
+		let mut k = 0;
+		for r in 0..=rows {
+			while k < groups.len() && cells[groups[k] as usize] < r * s {
+				k += 1;
+			}
+			starts.push(k);
+		}
+		Self { groups, rows: starts }
+	}
+
+	/// The groups on padded row `r`.
+	fn of(&self, r: usize) -> &[u32] {
+		&self.groups[self.rows[r]..self.rows[r + 1]]
 	}
 }
 
@@ -825,7 +997,7 @@ mod tests {
 			let (x, y) = (i % s, i / s);
 			x < PAD || y < PAD || x >= s - PAD || y >= rows - PAD
 		});
-		assert!(padding.into_iter().all(|i| e.u[i] == 0.0 && e.prev[i] == 0.0 && e.w[i] == 0.0));
+		assert!(padding.into_iter().all(|i| e.u[i] == 0.0 && e.prev[i] == 0.0));
 		let (field, intensity) = e.prepare_frame();
 		assert!(field.iter().any(|&v| v != 0.0));
 		assert!(intensity.iter().all(|&v| v >= 0.0) && intensity.iter().any(|&v| v > 0.0));
@@ -1028,5 +1200,32 @@ mod tests {
 		let bits = |(v, lap): (f32, f32)| (v.to_bits(), lap.to_bits());
 		let want: Vec<_> = (0..gw).map(|x| bits((u[at + x], nine_point(&u, at + x, s, cuts[x])))).collect();
 		assert_eq!(got.into_iter().map(bits).collect::<Vec<_>>(), want);
+	}
+
+	#[test]
+	fn group_rows_list_each_row_s_groups() {
+		let (s, rows) = (10, 6);
+		let cells = [52, 13, 57, 11, 30];
+		let g = GroupRows::new(&cells, s, rows);
+		let expect: [&[u32]; 6] = [&[], &[3, 1], &[], &[4], &[], &[0, 2]];
+		for (r, e) in expect.iter().enumerate() {
+			assert_eq!(g.of(r), *e, "row {r}");
+		}
+	}
+
+	#[test]
+	fn rim_w_copies_the_cells_within_reach_of_the_rim() {
+		let (gw, gh, rim) = (20, 16, 2);
+		let s = gw + 2 * PAD;
+		let from: Vec<f32> = (1..=s).map(|v| v as f32).collect();
+		for gy in 0..gh {
+			let mut to = vec![0.0; s];
+			rim_w(&from, &mut to, gy, gw, gh, rim);
+			for (i, (&t, &f)) in to.iter().zip(&from).enumerate() {
+				let whole = gy < rim + 3 || gy >= gh - rim - 3;
+				let read = whole || (PAD..PAD + gw).contains(&i) && (i - PAD < rim + 3 || i - PAD >= gw - rim - 3);
+				assert!(if read { t == f } else { t == 0.0 }, "row {gy} cell {i}");
+			}
+		}
 	}
 }

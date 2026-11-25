@@ -46,6 +46,8 @@ pub struct CpuEngine {
 	c2: Vec<f32>,
 	/// d^(1/n) per padded cell.
 	d: Vec<f32>,
+	/// The grid rows' stretches of equal medium, which the row loops take as constants.
+	runs: MediumRuns,
 	/// Cut bytes per padded cell (pml.rs, `cuts`); all 0 without mirrors.
 	cuts: Vec<u8>,
 	mirrors: bool,
@@ -101,6 +103,7 @@ impl CpuEngine {
 			axis: StencilCoefficients::of(options.stencil).axis.map(|a| a as f32),
 			c2: vec![0.0; cells],
 			d: vec![1.0; cells],
+			runs: MediumRuns::default(),
 			cuts: Vec::new(),
 			mirrors: false,
 			u: vec![0.0; cells],
@@ -202,11 +205,13 @@ impl CpuEngine {
 		self.shared.canvas_frame(&self.u, stages)
 	}
 
-	/// Copies the scene's maps into the padded buffers at the sub-step scale and builds the cuts, the Mur
-	/// chains, the PML and the source groups.
+	/// Copies the scene's maps into the padded buffers at the sub-step scale and builds the medium's runs, the
+	/// cuts, the Mur chains, the PML and the source groups.
 	fn load_scene(&mut self) {
 		let (scene, n) = (&self.shared.scene, self.shared.sub_steps);
 		scene.fill_sub_step_medium(n, &mut self.c2, &mut self.d);
+		let (gw, gh) = (scene.grid_width() as usize, scene.grid_height() as usize);
+		self.runs = MediumRuns::new(&self.c2, &self.d, self.stride, gw, gh);
 		self.cuts = pml::cuts(scene);
 		self.mirrors = self.cuts.iter().any(|&c| c != 0);
 		self.mur = mur_chains(scene, &self.c2, &self.d);
@@ -275,53 +280,43 @@ impl CpuEngine {
 	/// stages when `intensity`.
 	fn leapfrog_pass(&mut self, intensity: bool) {
 		let (s, gw) = (self.stride, self.shared.scene.grid_width() as usize);
-		let (u, c2, d, cuts, mirrors) = (&self.u, &self.c2, &self.d, &self.cuts, self.mirrors);
+		let (u, c2, d, runs, cuts, mirrors) = (&self.u, &self.c2, &self.d, &self.runs, &self.cuts, self.mirrors);
 		let stages = Self::stages(&mut self.s1, &mut self.s2, self.alpha, intensity);
 		grid_rows(&mut self.prev, stages, s, gw, |r, next| {
 			let at = r * s + PAD;
-			let (c2, d) = (&c2[at..][..gw], &d[at..][..gw]);
-			let update = |x: usize, next: &mut f32, v: f32, lap: f32| {
-				*next = v + ((v - *next) * d[x] + lap * c2[x] * centred(d[x]));
-			};
-			// The cells of `span` with no cut, on row slices, as `nine_point` and `update` in the same order. Every
-			// slice has the span's length, so the loop has no bounds checks and vectorises.
-			let uncut = |span: Range<usize>, next: &mut [f32]| {
-				let len = span.len();
-				let tap = |k: isize| &u[(at + span.start).wrapping_add_signed(k)..][..len];
-				let (si, one) = (s as isize, 1isize);
-				let (c, w, e, n, so) = (tap(0), tap(-one), tap(one), tap(-si), tap(si));
-				let (nw, ne, sw, se) = (tap(-si - 1), tap(-si + 1), tap(si - 1), tap(si + 1));
-				let (c2, d, next) = (&c2[span.clone()], &d[span.clone()], &mut next[span]);
-				for x in 0..len {
-					let v = c[x];
-					let diagonals = ((nw[x] - v) + (ne[x] - v)) + ((sw[x] - v) + (se[x] - v));
-					let axes = ((n[x] - v) + (so[x] - v)) + ((w[x] - v) + (e[x] - v));
-					let lap = K9_DIAGONAL * diagonals + K9_AXIS * axes;
-					next[x] = v + ((v - next[x]) * d[x] + lap * c2[x] * centred(d[x]));
+			runs.of_row(r, row_cuts(cuts, mirrors, at, gw), |cells, medium, cuts| {
+				let (at, len, next) = (at + cells.start, cells.len(), &mut next[cells.clone()]);
+				match medium {
+					Some(m) => nine_row(u, at, s, len, cuts, |x, v, lap| {
+						next[x] = v + ((v - next[x]) * m.d + lap * m.c2 * m.centred);
+					}),
+					None => {
+						let (c2, d) = (&c2[at..][..len], &d[at..][..len]);
+						nine_row(u, at, s, len, cuts, |x, v, lap| {
+							next[x] = v + ((v - next[x]) * d[x] + lap * c2[x] * centred(d[x]));
+						});
+					}
 				}
-			};
-			match row_cuts(cuts, mirrors, at, gw) {
-				None => uncut(0..gw, next),
-				Some(cuts) => cut_spans(cuts, |span, cut| {
-					if !cut {
-						return uncut(span, next);
-					}
-					for x in span {
-						update(x, &mut next[x], u[at + x], nine_point(u, at + x, s, cuts[x]));
-					}
-				}),
-			}
+			});
 		});
 	}
 
 	/// The modified equation's first pass: `w = c2 L u` on every grid cell.
 	fn inner_pass(&mut self) {
 		let (s, gw) = (self.stride, self.shared.scene.grid_width() as usize);
-		let (u, c2, cuts, axis, mirrors) = (&self.u, &self.c2, &self.cuts, &self.axis, self.mirrors);
+		let (u, c2, runs, cuts, axis, mirrors) = (&self.u, &self.c2, &self.runs, &self.cuts, &self.axis, self.mirrors);
 		grid_rows(&mut self.w, None, s, gw, |r, w| {
 			let at = r * s + PAD;
-			let c2 = &c2[at..][..gw];
-			drp_row(u, at, s, gw, axis, row_cuts(cuts, mirrors, at, gw), |x, lap| w[x] = c2[x] * lap);
+			runs.of_row(r, row_cuts(cuts, mirrors, at, gw), |cells, medium, cuts| {
+				let (at, len, w) = (at + cells.start, cells.len(), &mut w[cells.clone()]);
+				match medium {
+					Some(m) => drp_row(u, at, s, len, axis, cuts, |x, lap| w[x] = m.c2 * lap),
+					None => {
+						let c2 = &c2[at..][..len];
+						drp_row(u, at, s, len, axis, cuts, |x, lap| w[x] = c2[x] * lap);
+					}
+				}
+			});
 		});
 	}
 
@@ -329,15 +324,27 @@ impl CpuEngine {
 	/// stages when `intensity`.
 	fn outer_pass(&mut self, intensity: bool) {
 		let (s, gw) = (self.stride, self.shared.scene.grid_width() as usize);
-		let (u, w, c2, d, cuts, axis, mirrors) =
-			(&self.u, &self.w, &self.c2, &self.d, &self.cuts, &self.axis, self.mirrors);
+		let (u, w, c2, d, runs, cuts, axis, mirrors) =
+			(&self.u, &self.w, &self.c2, &self.d, &self.runs, &self.cuts, &self.axis, self.mirrors);
 		let stages = Self::stages(&mut self.s1, &mut self.s2, self.alpha, intensity);
 		grid_rows(&mut self.prev, stages, s, gw, |r, next| {
 			let at = r * s + PAD;
-			let (uc, wc, c2, d) = (&u[at..][..gw], &w[at..][..gw], &c2[at..][..gw], &d[at..][..gw]);
-			drp_row(w, at, s, gw, axis, row_cuts(cuts, mirrors, at, gw), |x, lw| {
-				let c = uc[x];
-				next[x] = c + ((c - next[x]) * d[x] + (wc[x] + c2[x] * lw * INV12) * centred(d[x]));
+			runs.of_row(r, row_cuts(cuts, mirrors, at, gw), |cells, medium, cuts| {
+				let (at, len, next) = (at + cells.start, cells.len(), &mut next[cells.clone()]);
+				let (uc, wc) = (&u[at..][..len], &w[at..][..len]);
+				match medium {
+					Some(m) => drp_row(w, at, s, len, axis, cuts, |x, lw| {
+						let c = uc[x];
+						next[x] = c + ((c - next[x]) * m.d + (wc[x] + m.c2 * lw * INV12) * m.centred);
+					}),
+					None => {
+						let (c2, d) = (&c2[at..][..len], &d[at..][..len]);
+						drp_row(w, at, s, len, axis, cuts, |x, lw| {
+							let c = uc[x];
+							next[x] = c + ((c - next[x]) * d[x] + (wc[x] + c2[x] * lw * INV12) * centred(d[x]));
+						});
+					}
+				}
 			});
 		});
 	}
@@ -423,6 +430,85 @@ fn grid_rows(out: &mut [f32], stages: Option<Stages<'_>>, s: usize, gw: usize, r
 	}
 }
 
+/// The shortest stretch of a row with one medium that the row loops take as constants ([`MediumRuns`]).
+const MIN_RUN: usize = 16;
+
+/// The medium a stretch of cells shares: its c2, d and `centred(d)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Medium {
+	c2: f32,
+	d: f32,
+	centred: f32,
+}
+
+/// A stretch of a grid row's cells: `medium` when they share one, else None and each cell reads its own.
+#[derive(Clone, Debug, PartialEq)]
+struct Run {
+	cells: Range<usize>,
+	medium: Option<Medium>,
+}
+
+/// Per grid row the stretches of [`MIN_RUN`] cells or more with the same c2 and d bits, and the cells between,
+/// in order and covering the row. Most of a scene's cells lie in such stretches; there the row loops read neither
+/// map.
+#[derive(Default)]
+struct MediumRuns {
+	runs: Vec<Run>,
+	/// The first run of each grid row, then the number of runs.
+	rows: Vec<usize>,
+}
+
+impl MediumRuns {
+	/// The runs of the `gh` grid rows of `gw` cells of the padded maps `c2` and `d` (rows of `s`).
+	fn new(c2: &[f32], d: &[f32], s: usize, gw: usize, gh: usize) -> Self {
+		let mut out = Self { runs: Vec::new(), rows: Vec::with_capacity(gh + 1) };
+		for gy in 0..gh {
+			out.rows.push(out.runs.len());
+			let at = (gy + PAD) * s + PAD;
+			medium_runs(&c2[at..][..gw], &d[at..][..gw], MIN_RUN, &mut out.runs);
+		}
+		out.rows.push(out.runs.len());
+		out
+	}
+
+	/// Hands `f` the runs of padded row `r` in order, each with the cut bytes of its cells when one of them is cut
+	/// (`cuts` the row's, [`row_cuts`]).
+	#[inline(always)]
+	fn of_row(&self, r: usize, cuts: Option<&[u8]>, mut f: impl FnMut(Range<usize>, Option<Medium>, Option<&[u8]>)) {
+		let gy = r - PAD;
+		for run in &self.runs[self.rows[gy]..self.rows[gy + 1]] {
+			let cuts = cuts.map(|c| &c[run.cells.clone()]).filter(|c| c.iter().any(|&c| c != 0));
+			f(run.cells.clone(), run.medium, cuts);
+		}
+	}
+}
+
+/// Appends the runs of one row of `c2` and `d` to `out`: each maximal stretch of at least `min` cells with the same
+/// bits of both with its medium, the cells between such stretches in runs without one.
+fn medium_runs(c2: &[f32], d: &[f32], min: usize, out: &mut Vec<Run>) {
+	let n = c2.len();
+	let bits = |x: usize| (c2[x].to_bits(), d[x].to_bits());
+	let mut mixed: Option<usize> = None;
+	let mut start = 0;
+	while start < n {
+		let b = bits(start);
+		let end = (start..n).find(|&x| bits(x) != b).unwrap_or(n);
+		if end - start >= min {
+			if let Some(m) = mixed.take() {
+				out.push(Run { cells: m..start, medium: None });
+			}
+			let (c2, d) = (c2[start], d[start]);
+			out.push(Run { cells: start..end, medium: Some(Medium { c2, d, centred: centred(d) }) });
+		} else {
+			mixed.get_or_insert(start);
+		}
+		start = end;
+	}
+	if let Some(m) = mixed {
+		out.push(Run { cells: m..n, medium: None });
+	}
+}
+
 /// The 9-point Laplacian at padded cell `i` (row length `s`) with the cut byte `cut`: a diagonal tap
 /// is dropped when either axis neighbour it passes is a mirror, so no wave crosses a mirror line
 /// that is only 8-connected; the rule is symmetric between the two cells of a tap. Same order of
@@ -436,6 +522,38 @@ fn nine_point(u: &[f32], i: usize, s: usize, cut: u8) -> f32 {
 		((tap(i - s - 1, nw) - v) + (tap(i - s + 1, ne) - v)) + ((tap(i + s - 1, sw) - v) + (tap(i + s + 1, se) - v));
 	let axes = ((u[i - s] - v) + (u[i + s] - v)) + ((u[i - 1] - v) + (u[i + 1] - v));
 	K9_DIAGONAL * diagonals + K9_AXIS * axes
+}
+
+/// The 9-point Laplacian of the `len` cells from padded cell `at`, handed to `f` with the cell's offset from `at` and
+/// its value. Cells without a cut run on row slices ([`nine_span`]), the cut ones through [`nine_point`].
+#[inline(always)]
+fn nine_row(u: &[f32], at: usize, s: usize, len: usize, cuts: Option<&[u8]>, mut f: impl FnMut(usize, f32, f32)) {
+	let Some(cuts) = cuts else { return nine_span(u, at, s, 0..len, &mut f) };
+	cut_spans(cuts, |span, cut| {
+		if !cut {
+			return nine_span(u, at, s, span, &mut f);
+		}
+		for x in span {
+			f(x, u[at + x], nine_point(u, at + x, s, cuts[x]));
+		}
+	});
+}
+
+/// The 9-point Laplacian of the cells `span` from padded cell `at`, none of them cut, on row slices, as
+/// [`nine_point`] in the same order. Every slice has the span's length, so the loop has no bounds checks.
+#[inline(always)]
+fn nine_span(u: &[f32], at: usize, s: usize, span: Range<usize>, f: &mut impl FnMut(usize, f32, f32)) {
+	let x0 = span.start;
+	let tap = |k: isize| &u[(at + x0).wrapping_add_signed(k)..][..span.len()];
+	let si = s as isize;
+	let (c, w, e, n, so) = (tap(0), tap(-1), tap(1), tap(-si), tap(si));
+	let (nw, ne, sw, se) = (tap(-si - 1), tap(-si + 1), tap(si - 1), tap(si + 1));
+	for x in 0..span.len() {
+		let v = c[x];
+		let diagonals = ((nw[x] - v) + (ne[x] - v)) + ((sw[x] - v) + (se[x] - v));
+		let axes = ((n[x] - v) + (so[x] - v)) + ((w[x] - v) + (e[x] - v));
+		f(x0 + x, v, K9_DIAGONAL * diagonals + K9_AXIS * axes);
+	}
 }
 
 /// The DRP Laplacian at padded cell `i` (row length `s`), the taps beyond a mirror dropped (`cut`):
@@ -471,19 +589,19 @@ fn cut_spans(cuts: &[u8], mut f: impl FnMut(Range<usize>, bool)) {
 	}
 }
 
-/// The DRP Laplacian of the `gw` grid cells from padded cell `at`, handed to `f` with the cell's
-/// offset in the row. Cells without a cut run on row slices ([`drp_span`]), the cut ones through [`drp`].
+/// The DRP Laplacian of the `len` cells from padded cell `at`, handed to `f` with the cell's offset from `at`.
+/// Cells without a cut run on row slices ([`drp_span`]), the cut ones through [`drp`].
 #[inline(always)]
 fn drp_row(
 	u: &[f32],
 	at: usize,
 	s: usize,
-	gw: usize,
+	len: usize,
 	a: &[f32; 4],
 	cuts: Option<&[u8]>,
 	mut f: impl FnMut(usize, f32),
 ) {
-	let Some(cuts) = cuts else { return drp_span(u, at, s, 0..gw, a, &mut f) };
+	let Some(cuts) = cuts else { return drp_span(u, at, s, 0..len, a, &mut f) };
 	cut_spans(cuts, |span, cut| {
 		if !cut {
 			return drp_span(u, at, s, span, a, &mut f);
@@ -874,5 +992,41 @@ mod tests {
 			got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
 			want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
 		);
+	}
+
+	#[test]
+	fn medium_runs_cover_the_row_and_keep_the_long_stretches() {
+		let c2 = [1.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0, 4.0, 5.0, 5.0, 5.0];
+		let d = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, -0.0];
+		let medium = |c2: f32, d: f32| Some(Medium { c2, d, centred: centred(d) });
+		let mut runs = Vec::new();
+		medium_runs(&c2, &d, 3, &mut runs);
+		let want = [
+			Run { cells: 0..3, medium: medium(1.0, 0.5) },
+			Run { cells: 3..5, medium: None },
+			Run { cells: 5..9, medium: medium(3.0, 0.5) },
+			Run { cells: 9..13, medium: None },
+		];
+		assert_eq!(runs, want);
+		runs.clear();
+		medium_runs(&[0.0; 4], &[1.0, 1.0, 1.0, 1.0], 8, &mut runs);
+		assert_eq!(runs, [Run { cells: 0..4, medium: None }]);
+		runs.clear();
+		medium_runs(&[0.0; 4], &[1.0; 4], 4, &mut runs);
+		assert_eq!(runs, [Run { cells: 0..4, medium: medium(0.0, 1.0) }]);
+	}
+
+	#[test]
+	fn a_row_with_cuts_matches_nine_point_per_cell() {
+		let (s, gw) = (20, 14);
+		let u: Vec<f32> = (0..s * 10).map(|i| ((i * 7919 % 101) as f32 - 50.0) * 0.013).collect();
+		let at = 4 * s + PAD;
+		let mut cuts = vec![0u8; gw];
+		(cuts[3], cuts[4], cuts[10]) = (0b0001_0010, 0b1000_0000, 0b0000_0101);
+		let mut got = vec![(f32::NAN, f32::NAN); gw];
+		nine_row(&u, at, s, gw, Some(&cuts), |x, v, lap| got[x] = (v, lap));
+		let bits = |(v, lap): (f32, f32)| (v.to_bits(), lap.to_bits());
+		let want: Vec<_> = (0..gw).map(|x| bits((u[at + x], nine_point(&u, at + x, s, cuts[x])))).collect();
+		assert_eq!(got.into_iter().map(bits).collect::<Vec<_>>(), want);
 	}
 }

@@ -230,6 +230,60 @@ step:
 On 8 threads the full canvas is bound by the memory's bandwidth. The probe series of Example01 with
 `FourthOrderLaplacian="false"`, with and without its mirror, 600 steps, are byte for byte the same before and after.
 
+## The CPU engine's medium runs
+
+Each grid row of the CPU engine keeps its stretches of 16 cells or more with the same c2 and d bits
+(`crates/waveduderust/src/engine/cpu.rs`, `MediumRuns`); the row loops of the three passes take such a stretch's c2,
+d and `centred(d)` as constants and read neither map there. 81 to 100 % of the cells of the 54 example projects lie in
+such stretches. The other cells, the CPML and the forcing read the maps as before.
+
+2026-11-25, the VirtualBox guest above (Ryzen 7 4700U, 8 vCPUs), before (10a6a02) and after, alternated, two runs
+each. Blank scene, ms a step: `RAYON_NUM_THREADS=<n> waveduderust-cli bench --width 1920 --height 1080 --rim <rim>
+--stencil <nine|fourth> --captures-every <0|2> --steps 200` (rim 0 without captures; rim 32 with captures every 2
+steps, the bench's two rows):
+
+| Stencil, rim, captures, threads | Before | After |
+|---|---|---|
+| 9-point, 0, none, 1 | 7.20 to 7.65 | 5.88 to 6.06 |
+| 9-point, 32, none, 1 | 12.0 to 13.2 | 10.1 to 11.6 |
+| 9-point, 32, every 2, 1 | 14.6 to 14.7 | 13.3 to 13.8 |
+| 9-point, 0, none, 8 | 5.17 to 5.31 | 3.90 to 3.91 |
+| 9-point, 32, none, 8 | 6.78 to 7.07 | 5.19 to 5.80 |
+| 9-point, 32, every 2, 8 | 7.54 to 7.92 | 6.34 to 6.72 |
+| 4th order, 0, none, 1 | 14.7 to 14.9 | 13.8 to 14.1 |
+| 4th order, 32, none, 1 | 22.8 to 24.5 | 22.8 to 23.1 |
+| 4th order, 32, every 2, 1 | 24.5 to 25.8 | 24.0 to 25.5 |
+| 4th order, 0, none, 8 | 8.28 to 8.91 | 7.05 to 7.75 |
+| 4th order, 32, none, 8 | 11.5 to 12.5 | 10.1 to 10.2 |
+| 4th order, 32, every 2, 8 | 12.8 to 13.4 | 11.3 to 12.2 |
+
+Example projects, seconds for `RAYON_NUM_THREADS=<n> /usr/bin/time -f %e waveduderust-cli probes --out <dir> --steps
+300 <project>`, each as saved (4th order) and with `FourthOrderLaplacian="false"` added to its `Simulation` (9-point):
+
+| Project, stencil, threads | Before | After |
+|---|---|---|
+| Example01, 4th order, 1 | 5.49 to 5.51 | 5.37 to 5.44 |
+| Example01, 9-point, 1 | 3.21 to 3.31 | 3.17 to 3.28 |
+| Example13 (1668 media), 4th order, 1 | 6.74 to 6.79 | 7.07 to 7.19 |
+| Example13, 9-point, 1 | 6.49 to 6.95 | 6.77 to 7.24 |
+| Example21, 4th order, 1 | 19.8 to 20.0 | 18.7 to 18.9 |
+| Example21, 9-point, 1 | 12.6 | 12.6 to 13.5 |
+| Example01, 4th order, 8 | 2.08 to 2.66 | 2.02 to 2.70 |
+| Example01, 9-point, 8 | 1.34 to 1.64 | 1.18 |
+| Example13, 4th order, 8 | 2.70 to 2.83 | 2.62 to 2.69 |
+| Example13, 9-point, 8 | 2.67 to 2.86 | 2.43 to 2.56 |
+| Example21, 4th order, 8 | 8.38 to 8.57 | 7.52 to 7.55 |
+| Example21, 9-point, 8 | 5.23 to 5.39 | 4.69 to 4.73 |
+
+The blank canvas and Example21 gain most on 8 threads, where the passes are bound by the memory's bandwidth (10 to
+25 % on the blank canvas). Example13 on one thread is 2 to 6 % slower: about 180 runs a row, and slower by about as
+much with no constant runs at all (a minimum of 100000 cells: 6.98 to 7.09 s against 6.85 to 6.90), so the cost is the
+split into runs, not the constants; minimums of 32, 64 and 128 cells were no better than 16 on Example13 and
+Example21. Example21 with the 9-point stencil on one thread gains nothing. Each kind of loop has packed `mulps`/`addps`/`subps` in
+the release binary's disassembly in both forms, constants and maps. The hashes of the field, the previous field, the
+intensity stages and two captures every 50 of 300 steps of nine projects (mirrors, both stencils, Mur and reflective
+edges, many media, many sources, a 3060x1260 lens) are bit for bit the same before and after.
+
 ## Other operations
 
 2026-11-06 unless noted.

@@ -675,8 +675,8 @@ were left out of line too, so the kernels kept the baseline's instruction set al
 compiled for AVX2. Now the outer cell is a function inlined by force, the DRP taps are slices of the span's length
 indexed in step, and those closures are inlined by force where `rev2_wide` is set, on x86-64 (`forced` in
 engine/rev2/mod.rs): every kernel has 4-lane bodies at the x86-64 baseline, in aarch64 and in wasm with simd128, and
-8-lane bodies in `isa::wide`'s AVX2 copy, the remainder of each span scalar. The CPML's loops keep their own `isa::wide` and vector bodies
-([The CPU engine's AVX2 dispatch](#the-cpu-engines-avx2-dispatch)).
+8-lane bodies in `isa::wide`'s AVX2 copy, the remainder of each span scalar. The CPML's loops keep their own
+`isa::wide` and vector bodies ([The CPU engine's AVX2 dispatch](#the-cpu-engines-avx2-dispatch)).
 
 Steps a second, the harness of [The CPU_REV2 engine's fused steps](#the-cpu_rev2-engines-fused-steps) at its
 default K (24 steps to warm up, then 4 to 36 batches of `advance_steps(24)`, 12 to 36 on 8 threads), two passes;

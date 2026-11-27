@@ -476,14 +476,16 @@ lane kernels on a portable 4-lane type against the generic backend bit for bit (
 unit test runs only in wasm, and tests/rev2.rs (an 8-thread pool) would need adapting for single-threaded wasm, so
 until web tests run this harness is its check.
 
-The generic backend's 4th order is slow in wasm: its DRP bodies stay scalar there, where the legacy engine's DRP span
-vectorises ([The CPU engine's loops vectorised in wasm](#the-cpu-engines-loops-vectorised-in-wasm)).
+The generic backend's 4th order was slow in wasm: its outer update stayed scalar there, where the legacy engine's DRP
+span vectorises ([The CPU engine's loops vectorised in wasm](#the-cpu-engines-loops-vectorised-in-wasm)); it now
+vectorises ([The CPU_REV2 engine's generic backend vectorised](#the-cpu_rev2-engines-generic-backend-vectorised)).
 
 Inlining: the orchestration's closures and row functions are `#[inline(always)]` natively, so the code a backend's
 `#[target_feature]` entry runs takes its instruction set. In wasm the module's instruction set is everywhere, and
 forcing them grew the harness's wasm from 669877 to 685381 bytes (2.3 %) for 0 to 3 % (the last column; in an earlier
 run of the same comparison with the pairs below, -1 to +2 %), within the runs' spread, so they are inlined by force
-only off wasm (`#[cfg_attr(not(target_arch = "wasm32"), inline(always))]`), as engine/isa.rs found for the CPU engine.
+only where a row entry has a run-time copy for a wider instruction set (`#[cfg_attr(rev2_wide, inline(always))]`,
+`rev2_wide` set by build.rs on x86-64), as engine/isa.rs found for the CPU engine.
 
 8 cells per iteration, as two `v128`s side by side (each operation on both 4-cell groups in a row, what V8's
 experimental revectorization to 256-bit instructions fuses, `--experimental-wasm-revectorize`, off by default), gained
@@ -644,6 +646,71 @@ field and both intensity stages: all bit for bit equal; the benchmark's hashes a
 engine once, never the CPU_REV2 engine); 52 further processes per engine (16 at 400x300 and 10 at 800x600 per rim,
 1536 steps in batches of 24, 6 at a time) gave one hash per grid and rim, the same for all three engines. Like the divergence under register pressure in
 [The CPU_REV2 engine in wasm](#the-cpu_rev2-engine-in-wasm), not explained, and here on engines the web already runs.
+
+## The CPU_REV2 engine's generic backend vectorised
+
+2026-11-27, the workstation's VirtualBox guest (Ryzen 7 4700U, 8 vCPUs). Which loops of the generic backend
+(engine/rev2/backend/generic.rs) have a vector body, read from the disassembly: natively from the harness of
+[The CPU_REV2 engine's fused steps](#the-cpu_rev2-engines-fused-steps) (`objdump -d`, the functions of the
+`Generic` instantiations and of `isa::with_avx2` over them, each loop's packed and scalar `addps`, `subps`,
+`mulps`); for aarch64 and wasm32 with simd128 from the library's assembly, built without LTO (the pre-link
+pipeline of an LTO build leaves the vectoriser to the link):
+
+```sh
+CARGO_PROFILE_RELEASE_LTO=false cargo rustc --release -p waveduderust --lib --no-default-features \
+  --target aarch64-unknown-linux-gnu -- --emit=asm
+RUSTFLAGS="--cfg=web_sys_unstable_apis -C target-feature=+simd128" CARGO_PROFILE_RELEASE_LTO=false \
+  cargo rustc --release -p waveduderust --lib --no-default-features --target wasm32-unknown-unknown -- --emit=asm
+```
+
+| Kernel (each on a uniform run and on the planes) | x86-64 before | aarch64, wasm before | x86-64 after | aarch64, wasm after |
+|---|---|---|---|---|
+| 9-point, with and without the stages | SSE2, never AVX2 | NEON, simd128 | SSE2 and AVX2 | NEON, simd128 |
+| 4th order inner (`lap`) | SSE2, never AVX2 | NEON, simd128 | SSE2 and AVX2 | NEON, simd128 |
+| 4th order outer, with and without the stages | scalar | scalar | SSE2 and AVX2 | NEON, simd128 |
+
+Before, the outer update's cell was a closure called from two loops, which stayed out of line, one call per cell;
+and the closures between the row entry and the kernels (`NineLine::row`, `DrpLine`'s, the passes' row closures)
+were left out of line too, so the kernels kept the baseline's instruction set although `isa::wide` ran the row
+compiled for AVX2. Now the outer cell is a function inlined by force, the DRP taps are slices of the span's length
+indexed in step, and those closures are inlined by force where `rev2_wide` is set, on x86-64 (`forced` in
+engine/rev2/mod.rs): every kernel has 4-lane bodies at the x86-64 baseline, in aarch64 and in wasm with simd128, and
+8-lane bodies in `isa::wide`'s AVX2 copy, the remainder of each span scalar. The CPML's loops keep their own `isa::wide` and vector bodies
+([The CPU engine's AVX2 dispatch](#the-cpu-engines-avx2-dispatch)).
+
+Steps a second, the harness of [The CPU_REV2 engine's fused steps](#the-cpu_rev2-engines-fused-steps) at its
+default K (24 steps to warm up, then 4 to 36 batches of `advance_steps(24)`, 12 to 36 on 8 threads), two passes;
+1 thread is `taskset -c 3`. The SSE2 columns ran with `isa::wide` held to the baseline by an environment variable
+added for the measurement (not kept), legacy engine included; "Generic before" is f82ff29 as it runs (its kernels
+at the baseline whatever the CPU); the last two columns are the generic backend over the legacy engine, the means
+of the passes:
+
+| Threads | Stencil | Grid, rim | Legacy, SSE2 | Legacy, AVX2 | Generic before | Generic, SSE2 | Generic, AVX2 | AVX2 backend | Generic / legacy, SSE2 | AVX2 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 9-point | 800x600, 0 | 668, 615 | 831, 796 | 970, 947 | 970, 958 | 1464, 1529 | 1714, 1907 | 1.50 | 1.84 |
+| 1 | 9-point | 800x600, 32 | 275, 275 | 336, 324 | 490, 488 | 347, 359 | 602, 635 | 652, 708 | 1.28 | 1.87 |
+| 1 | 9-point | 1920x1080, 0 | 156, 145 | 172, 170 | 222, 235 | 226, 231 | 392, 395 | 476, 491 | 1.52 | 2.29 |
+| 1 | 9-point | 1920x1080, 32 | 94, 95 | 109, 114 | 130, 155 | 126, 129 | 229, 220 | 250, 252 | 1.35 | 2.01 |
+| 1 | 4th order | 800x600, 0 | 353, 346 | 481, 448 | 110, 111 | 347, 343 | 470, 471 | 674, 676 | 0.99 | 1.01 |
+| 1 | 4th order | 800x600, 32 | 133, 136 | 163, 175 | 81, 82 | 153, 162 | 251, 270 | 307, 326 | 1.17 | 1.54 |
+| 1 | 4th order | 1920x1080, 0 | 81, 88 | 109, 112 | 24, 26 | 84, 87 | 121, 131 | 161, 169 | 1.01 | 1.15 |
+| 1 | 4th order | 1920x1080, 32 | 49, 50 | 66, 64 | 21, 22 | 53, 49 | 85, 78 | 102, 92 | 1.04 | 1.26 |
+| 8 | 9-point | 800x600, 0 | 1414, 868 | 1559, 943 | 2522, 2026 | 2803, 2069 | 3908, 2955 | 5024, 3639 | 2.13 | 2.74 |
+| 8 | 9-point | 800x600, 32 | 608, 420 | 556, 560 | 1057, 1100 | 794, 865 | 1366, 1377 | 1482, 1345 | 1.61 | 2.46 |
+| 8 | 9-point | 1920x1080, 0 | 247, 264 | 254, 256 | 616, 865 | 732, 738 | 1066, 1214 | 1447, 1327 | 2.87 | 4.47 |
+| 8 | 9-point | 1920x1080, 32 | 201, 182 | 210, 198 | 394, 407 | 357, 320 | 477, 470 | 543, 527 | 1.77 | 2.32 |
+| 8 | 4th order | 800x600, 0 | 826, 795 | 914, 981 | 329, 352 | 900, 825 | 1128, 1049 | 1376, 1261 | 1.06 | 1.15 |
+| 8 | 4th order | 800x600, 32 | 351, 319 | 388, 395 | 239, 244 | 400, 374 | 592, 555 | 664, 571 | 1.16 | 1.47 |
+| 8 | 4th order | 1920x1080, 0 | 216, 185 | 236, 191 | 94, 92 | 275, 254 | 311, 359 | 368, 327 | 1.32 | 1.57 |
+| 8 | 4th order | 1920x1080, 32 | 135, 132 | 149, 145 | 78, 71 | 144, 148 | 183, 198 | 200, 207 | 1.09 | 1.29 |
+
+The generic backend computes the legacy engine's field bit for bit in every run (the harness compares the padded
+field with master's CPU engine), as do its AVX2 copy against its baseline copy on the backends' harness
+(generic.rs's unit test) and tests/rev2.rs. Held to SSE2, the generic backend is now faster than the legacy
+engine in every case but the 4th order on one thread without a rim, where they are even (0.99 to 1.01). The default
+CPU engine (engine/mod.rs, `cpu_engine`) is the CPU_REV2 engine only on a backend other than the generic one, so
+an x86-64 CPU without AVX2 and FMA runs the legacy engine; by these figures the generic backend could take its place
+there (not changed: measured on this CPU held to SSE2, not on an SSE2-only CPU, and not on ARM).
 
 ## Other operations
 

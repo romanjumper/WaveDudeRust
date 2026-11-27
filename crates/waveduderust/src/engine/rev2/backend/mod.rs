@@ -66,11 +66,15 @@
 //!
 //! The entry: the engine calls the kernels only inside [`RowKernels::run_row`] of the same backend value, which wraps
 //! a whole row's work (the kernels, the cut cells, the CPML's row, the forcing, Mur's condition) with closures marked
-//! `#[inline(always)]`, except in wasm (there the module's instruction set is the code's everywhere, and forcing them
-//! grew the wasm by 2 % for at most 3 %, within the runs' spread; docs/measurements.md, The CPU_REV2 engine in wasm).
+//! `#[cfg_attr(rev2_wide, inline(always))]`: `rev2_wide` (build.rs) is set where a row entry has a run-time copy for a
+//! wider instruction set (x86-64); elsewhere the module's instruction set is the code's everywhere, and forcing them
+//! only grew the binary (in wasm by 2 % for at most 3 %, within the runs' spread; docs/measurements.md, The CPU_REV2
+//! engine in wasm).
 //! A backend with a `#[target_feature]` instruction set runs the closure inlined into such a function (avx2.rs); the
 //! generic backend through the CPU engine's dispatch (engine/isa.rs, a plain call off x86-64), the simd128 backend
-//! through a plain call. The kernels must also be right when called outside it (the unit tests do).
+//! through a plain call. Every closure between the entry and the kernels is inlined by force too (engine/rev2/mod.rs,
+//! `forced`): one left out of line keeps the baseline's instruction set, kernels and all. The kernels must also be
+//! right when called outside it (the unit tests do).
 //!
 //! # Adding a backend
 //!
@@ -80,11 +84,12 @@
 //! tests/rev2.rs runs every available backend of [`Backend::ALL`] against the CPU engine. Both run natively only, so
 //! the simd128 backend is checked in Node until the web tests run (simd128.rs). Planned:
 //!
-//! - `sse2` (x86 and x86-64): 4 lanes, no FMA, `run_row` a plain call (SSE2 is the x86-64 baseline): the lane
-//!   kernels of lanes.rs on `__m128`, as the simd128 backend runs them on `v128`, bit for bit the CPU engine's.
 //! - `neon` (aarch64, and 32-bit ARM with NEON): `core::arch::aarch64` intrinsics or inline assembly, 4 lanes, `vfmaq`
 //!   for the multiply-adds. Plain VFP (32-bit ARM without NEON) is scalar: the generic backend already compiles to it,
 //!   and a `vfp` backend would pay only with hand-scheduled code.
+//!
+//! No `sse2` backend (the lane kernels of lanes.rs on `__m128`): the generic backend's loops vectorise by themselves,
+//! 4 lanes at the x86-64 baseline and 8 in its AVX2 copy, bit for bit (generic.rs, Vectors).
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod avx2;

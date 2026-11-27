@@ -158,7 +158,7 @@ unsafe fn advance<L: Lanes>(s1: &mut [f32], s2: &mut [f32], x: usize, v: L, alph
 }
 
 /// The DRP Laplacian of the cells `x..x + L::N` of a span from the seven rows `f` around it, each from 3 cells left of
-/// the span; `a` the weights in lanes (generic.rs, `drp_at`).
+/// the span; `a` the weights in lanes (generic.rs, `drp_cell`).
 ///
 /// # Safety
 ///

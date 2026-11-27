@@ -261,9 +261,16 @@ impl CpuRev2Engine {
 		let (u, c2, cuts) = (&h.u, &h.c2, &h.cuts);
 		let stages = Host::stages(&mut h.s1, &mut h.s2, h.alpha, intensity);
 		let mut rim = h.pml.as_mut().and_then(|p| p.begin(0, u, Medium { cuts, c2 }, 1.0, area));
-		grid_rows(kernels, &mut h.prev, stages, s, area, rim.as_mut(), |r, next, stages| {
-			line.row(r, &u[(r - 1) * s..(r + 2) * s], next, stages);
-		});
+		grid_rows(
+			kernels,
+			&mut h.prev,
+			stages,
+			s,
+			area,
+			rim.as_mut(),
+			#[cfg_attr(rev2_wide, inline(always))]
+			|r, next, stages| line.row(r, &u[(r - 1) * s..(r + 2) * s], next, stages),
+		);
 	}
 
 	/// The modified equation's first pass: `w = c2 L u` on the damaged cells.
@@ -273,7 +280,16 @@ impl CpuRev2Engine {
 		let line = DrpLine::of((h.stride, &h.c2, &h.d, &h.cuts, h.mirrors), h.axis, &self.uniform, kernels, &area.x);
 		let medium = Medium { cuts: &h.cuts, c2: &h.c2 };
 		let mut rim = h.pml.as_mut().and_then(|p| p.begin(0, u, medium, 1.0, area));
-		grid_rows(kernels, &mut h.w, None, s, area, rim.as_mut(), |r, w, _| line.lap(r, &plane_rows(u, r, s), w));
+		grid_rows(
+			kernels,
+			&mut h.w,
+			None,
+			s,
+			area,
+			rim.as_mut(),
+			#[cfg_attr(rev2_wide, inline(always))]
+			|r, w, _| line.lap(r, &plane_rows(u, r, s), w),
+		);
 	}
 
 	/// The modified equation's second pass: writes the next field over `prev` from `u` and the plane `w`, and the
@@ -284,9 +300,16 @@ impl CpuRev2Engine {
 		let line = DrpLine::of((h.stride, &h.c2, &h.d, &h.cuts, h.mirrors), h.axis, &self.uniform, kernels, &area.x);
 		let stages = Host::stages(&mut h.s1, &mut h.s2, h.alpha, intensity);
 		let mut rim = h.pml.as_mut().and_then(|p| p.begin(1, w, Medium { cuts: &h.cuts, c2: &h.c2 }, INV12, area));
-		grid_rows(kernels, &mut h.prev, stages, s, area, rim.as_mut(), |r, next, stages| {
-			line.outer(r, &u[r * s + PAD..][..gw], &plane_rows(w, r, s), next, stages);
-		});
+		grid_rows(
+			kernels,
+			&mut h.prev,
+			stages,
+			s,
+			area,
+			rim.as_mut(),
+			#[cfg_attr(rev2_wide, inline(always))]
+			|r, next, stages| line.outer(r, &u[r * s + PAD..][..gw], &plane_rows(w, r, s), next, stages),
+		);
 	}
 
 	/// The engine's backend as its type, `B` being that type: an engine is only built on a backend this CPU runs.
@@ -524,7 +547,7 @@ impl<'a, B: RowKernels> NineLine<'a, B> {
 	/// Writes the next field over `next`, the `gw` grid cells of padded row `r` holding the field one sub-step before,
 	/// on the columns `xs`, and advances `stages` (the row's), when given, by the values written. `u` holds the
 	/// padded rows `r - 1` to `r + 1` of the field.
-	#[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+	#[cfg_attr(rev2_wide, inline(always))]
 	fn row(&self, r: usize, u: &[f32], next: &mut [f32], mut stages: Option<Intensity<'_>>) {
 		let Self { s, gw, kernels, uniform, c2, d, cuts, mirrors, xs } = *self;
 		let (at, runs) = (r * s + PAD, uniform.row(r - PAD));
@@ -533,33 +556,48 @@ impl<'a, B: RowKernels> NineLine<'a, B> {
 		let rows: [&[f32]; 3] = std::array::from_fn(|k| &u[k * s + PAD - 1..][..gw + 2]);
 		let centre = s + PAD;
 		// The cells of `span` with no cut, a uniform run's with its constants.
-		let uncut = |span: Range<usize>, next: &mut [f32], stages: &mut Option<Intensity<'_>>| {
-			medium_spans(runs, c2, d, span, |piece, medium| {
-				let taps = rows.map(|row| &row[piece.start..piece.end + 2]);
-				let medium = match medium {
-					Some((c2, d)) => RowMedium::Uniform { c2, d },
-					None => RowMedium::Planes { c2: &c2[piece.clone()], d: &d[piece.clone()] },
-				};
-				let stages = stages.as_mut().map(|st| st.span(piece.start, piece.len()));
-				kernels.nine(taps, medium, &mut next[piece], stages);
-			});
-		};
+		let uncut = forced(
+			#[cfg_attr(rev2_wide, inline(always))]
+			|span: Range<usize>, next: &mut [f32], stages: &mut Option<Intensity<'_>>| {
+				medium_spans(
+					runs,
+					c2,
+					d,
+					span,
+					#[cfg_attr(rev2_wide, inline(always))]
+					|piece, medium| {
+						let taps = rows.map(|row| &row[piece.start..piece.end + 2]);
+						let medium = match medium {
+							Some((c2, d)) => RowMedium::Uniform { c2, d },
+							None => RowMedium::Planes { c2: &c2[piece.clone()], d: &d[piece.clone()] },
+						};
+						let stages = stages.as_mut().map(|st| st.span(piece.start, piece.len()));
+						kernels.nine(taps, medium, &mut next[piece], stages);
+					},
+				);
+			},
+		);
 		let Some(cuts) = row_cuts(cuts, mirrors, at, gw, xs) else {
 			return uncut(xs.clone(), next, &mut stages);
 		};
-		cut_spans(cuts, xs.clone(), |span, cut| {
-			if !cut {
-				return uncut(span, next, &mut stages);
-			}
-			for x in span {
-				let v = u[centre + x];
-				let lap = nine_point(u, centre + x, s, cuts[x]);
-				next[x] = v + ((v - next[x]) * d[x] + lap * c2[x] * centred(d[x]));
-				if let Some(st) = stages.as_mut() {
-					advance(&mut st.s1[x], &mut st.s2[x], next[x], st.alpha, 1.0 - st.alpha);
+		cut_spans(
+			cuts,
+			xs.clone(),
+			#[cfg_attr(rev2_wide, inline(always))]
+			|span, cut| {
+				if !cut {
+					return uncut(span, next, &mut stages);
 				}
-			}
-		});
+				for x in span {
+					let v = u[centre + x];
+					let lap = nine_point(u, centre + x, s, cuts[x]);
+					next[x] = v + ((v - next[x]) * d[x] + lap * c2[x] * centred(d[x]));
+					if let Some(st) = stages.as_mut() {
+						advance(&mut st.s1[x], &mut st.s2[x], next[x], st.alpha, 1.0 - st.alpha);
+					}
+				}
+			},
+		);
 	}
 }
 
@@ -594,67 +632,100 @@ impl<'a, B: RowKernels> DrpLine<'a, B> {
 
 	/// Hands `f` the pieces of the cells `span` of padded row `r` (all uncut), each with its medium: a uniform run's
 	/// constants, or the planes' values.
-	#[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+	#[cfg_attr(rev2_wide, inline(always))]
 	fn pieces(&self, r: usize, span: Range<usize>, mut f: impl FnMut(Range<usize>, RowMedium<'_>)) {
 		let at = r * self.s + PAD;
 		let (c2, d) = (&self.c2[at..][..self.gw], &self.d[at..][..self.gw]);
-		medium_spans(self.uniform.row(r - PAD), c2, d, span, |piece, medium| {
-			let medium = match medium {
-				Some((c2, d)) => RowMedium::Uniform { c2, d },
-				None => RowMedium::Planes { c2: &c2[piece.clone()], d: &d[piece.clone()] },
-			};
-			f(piece, medium);
-		});
+		medium_spans(
+			self.uniform.row(r - PAD),
+			c2,
+			d,
+			span,
+			#[cfg_attr(rev2_wide, inline(always))]
+			|piece, medium| {
+				let medium = match medium {
+					Some((c2, d)) => RowMedium::Uniform { c2, d },
+					None => RowMedium::Planes { c2: &c2[piece.clone()], d: &d[piece.clone()] },
+				};
+				f(piece, medium);
+			},
+		);
 	}
 
 	/// Writes `w = c2 L u` over `w`, the `gw` grid cells of padded row `r`, on the columns `xs`, from the 7 padded rows
 	/// `u` around it.
-	#[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+	#[cfg_attr(rev2_wide, inline(always))]
 	fn lap(&self, r: usize, u: &Rows<'_>, w: &mut [f32]) {
 		let (at, gw, kernels, axis) = (r * self.s + PAD, self.gw, self.kernels, &self.axis);
-		let uncut = |span: Range<usize>, w: &mut [f32]| {
-			self.pieces(r, span, |piece, medium| kernels.lap(span_rows(u, &piece), axis, medium, &mut w[piece]));
-		};
+		let uncut = forced(
+			#[cfg_attr(rev2_wide, inline(always))]
+			|span: Range<usize>, w: &mut [f32]| {
+				self.pieces(
+					r,
+					span,
+					#[cfg_attr(rev2_wide, inline(always))]
+					|piece, medium| kernels.lap(span_rows(u, &piece), axis, medium, &mut w[piece]),
+				);
+			},
+		);
 		let Some(cuts) = row_cuts(self.cuts, self.mirrors, at, gw, self.xs) else { return uncut(self.xs.clone(), w) };
 		let c2 = &self.c2[at..][..gw];
-		cut_spans(cuts, self.xs.clone(), |span, cut| {
-			if !cut {
-				return uncut(span, w);
-			}
-			for x in span {
-				w[x] = c2[x] * drp(u, x, axis, cuts[x]);
-			}
-		});
+		cut_spans(
+			cuts,
+			self.xs.clone(),
+			#[cfg_attr(rev2_wide, inline(always))]
+			|span, cut| {
+				if !cut {
+					return uncut(span, w);
+				}
+				for x in span {
+					w[x] = c2[x] * drp(u, x, axis, cuts[x]);
+				}
+			},
+		);
 	}
 
 	/// Writes the next field over `next`, the `gw` grid cells of padded row `r` holding the field one sub-step before,
 	/// on the columns `xs`, from the row's field `u` (its `gw` grid cells) and the 7 padded rows `w` around it; advances
 	/// `stages` (the row's), when given, by the values written.
-	#[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+	#[cfg_attr(rev2_wide, inline(always))]
 	fn outer(&self, r: usize, u: &[f32], w: &Rows<'_>, next: &mut [f32], mut stages: Option<Intensity<'_>>) {
 		let (at, gw, kernels, axis) = (r * self.s + PAD, self.gw, self.kernels, &self.axis);
-		let uncut = |span: Range<usize>, next: &mut [f32], stages: &mut Option<Intensity<'_>>| {
-			self.pieces(r, span, |piece, medium| {
-				let stages = stages.as_mut().map(|st| st.span(piece.start, piece.len()));
-				kernels.outer(&u[piece.clone()], span_rows(w, &piece), axis, medium, &mut next[piece], stages);
-			});
-		};
+		let uncut = forced(
+			#[cfg_attr(rev2_wide, inline(always))]
+			|span: Range<usize>, next: &mut [f32], stages: &mut Option<Intensity<'_>>| {
+				self.pieces(
+					r,
+					span,
+					#[cfg_attr(rev2_wide, inline(always))]
+					|piece, medium| {
+						let stages = stages.as_mut().map(|st| st.span(piece.start, piece.len()));
+						kernels.outer(&u[piece.clone()], span_rows(w, &piece), axis, medium, &mut next[piece], stages);
+					},
+				);
+			},
+		);
 		let Some(cuts) = row_cuts(self.cuts, self.mirrors, at, gw, self.xs) else {
 			return uncut(self.xs.clone(), next, &mut stages);
 		};
 		let (c2, d, wc) = (&self.c2[at..][..gw], &self.d[at..][..gw], &w[3][PAD..][..gw]);
-		cut_spans(cuts, self.xs.clone(), |span, cut| {
-			if !cut {
-				return uncut(span, next, &mut stages);
-			}
-			for x in span {
-				let (lw, c) = (drp(w, x, axis, cuts[x]), u[x]);
-				next[x] = c + ((c - next[x]) * d[x] + (wc[x] + c2[x] * lw * INV12) * centred(d[x]));
-				if let Some(st) = stages.as_mut() {
-					advance(&mut st.s1[x], &mut st.s2[x], next[x], st.alpha, 1.0 - st.alpha);
+		cut_spans(
+			cuts,
+			self.xs.clone(),
+			#[cfg_attr(rev2_wide, inline(always))]
+			|span, cut| {
+				if !cut {
+					return uncut(span, next, &mut stages);
 				}
-			}
-		});
+				for x in span {
+					let (lw, c) = (drp(w, x, axis, cuts[x]), u[x]);
+					next[x] = c + ((c - next[x]) * d[x] + (wc[x] + c2[x] * lw * INV12) * centred(d[x]));
+					if let Some(st) = stages.as_mut() {
+						advance(&mut st.s1[x], &mut st.s2[x], next[x], st.alpha, 1.0 - st.alpha);
+					}
+				}
+			},
+		);
 	}
 }
 
@@ -705,7 +776,7 @@ fn grid_rows(
 					_ => None,
 				};
 				kernels.run_row(
-					#[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+					#[cfg_attr(rev2_wide, inline(always))]
 					|| {
 						row(r, cells, stages);
 						if let (Some(shared), Some(mut rows), Some(scratch)) = (shared, rim_rows, scratch.as_mut()) {
@@ -715,6 +786,15 @@ fn grid_rows(
 				);
 			},
 		);
+}
+
+/// `f` itself: a closure written as the argument of a call may take `#[inline(always)]`, one bound by `let` may not.
+/// The row functions' closures are inlined by force where `rev2_wide` is set (build.rs), so the kernels compile into
+/// the backend's row entry ([`RowKernels::run_row`]) and take its instruction set: out of line they kept the
+/// baseline's.
+#[inline(always)]
+fn forced<F>(f: F) -> F {
+	f
 }
 
 /// The seven rows a DRP kernel reads for the grid cells `span`: from 3 cells left of it to 3 right of it.
